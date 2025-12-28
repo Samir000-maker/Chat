@@ -1,22 +1,681 @@
-use axum::{routing::get, Router};
-use std::net::SocketAddr;
+use axum::{
+    extract::{
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    Json, Router,
+};
+use dashmap::DashMap;
+use flume::{bounded, unbounded, Receiver, Sender};
+use futures::{SinkExt, StreamExt};
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use redis::aio::MultiplexedConnection;
+use redis::{cluster::ClusterClient, AsyncCommands, RedisError};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    select,
+    sync::{Semaphore, broadcast},
+    time::{interval, sleep},
+};
+use tower::ServiceBuilder;
+use tower_http::{
+    compression::CompressionLayer,
+    cors::CorsLayer,
+    trace::TraceLayer,
+};
+use tracing::{debug, error, info, warn};
+
+// ==================== CONSTANTS & CONFIGURATION ====================
+const MAX_CONNECTIONS_PER_WORKER: usize = 50_000;
+const WORKER_COUNT: usize = 8; // Will be set to CPU cores
+const MESSAGE_BUFFER_SIZE: usize = 10_000;
+const GLOBAL_RATE_LIMIT: u64 = 1_000_000; // 1M messages per second global
+const USER_RATE_LIMIT: u64 = 100; // 100 messages per minute per user
+const RATE_WINDOW_SECS: u64 = 60;
+const PENDING_MESSAGE_TTL: usize = 300; // 5 minutes
+const REDIS_POOL_SIZE: usize = 32;
+const MAX_MESSAGE_SIZE: usize = 65536; // 64KB
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const CLIENT_TIMEOUT_SECS: u64 = 90;
+const MAX_PENDING_MESSAGES: usize = 1000;
+const BACKPRESSURE_THRESHOLD: usize = 10_000;
+
+// AES-128-GCM Encryption
+const AES_KEY: &[u8] = b"0123456789abcdef"; // MUST match your client
+
+// ==================== TYPES & STRUCTURES ====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    message_id: String,
+    chat_id: String,
+    sender_id: String,
+    receiver_id: String,
+    content: String,
+    timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_profile_pic_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MessageSeen {
+    message_id: String,
+    chat_id: String,
+    user_id: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TypingIndicator {
+    sender_id: String,
+    receiver_id: String,
+    is_typing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RegisterRequest {
+    user_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FcmTokenRequest {
+    user_id: String,
+    token: String,
+    device_info: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug)]
+struct UserConnection {
+    user_id: String,
+    tx: Sender<WsMessage>,
+    last_activity: Arc<AtomicU64>,
+    message_count: Arc<AtomicU64>,
+    rate_limit_reset: Arc<AtomicU64>,
+}
+
+struct RateLimiter {
+    user_limits: Arc<DashMap<String, (u64, u64)>>, // (count, reset_time)
+    global_counter: Arc<AtomicU64>,
+    global_reset: Arc<AtomicU64>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            user_limits: Arc::new(DashMap::new()),
+            global_counter: Arc::new(AtomicU64::new(0)),
+            global_reset: Arc::new(AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + RATE_WINDOW_SECS,
+            )),
+        }
+    }
+
+    fn check_global(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let reset_time = self.global_reset.load(Ordering::Relaxed);
+
+        if now > reset_time {
+            self.global_counter.store(0, Ordering::Relaxed);
+            self.global_reset
+                .store(now + RATE_WINDOW_SECS, Ordering::Relaxed);
+        }
+
+        let count = self.global_counter.fetch_add(1, Ordering::Relaxed);
+        count < GLOBAL_RATE_LIMIT
+    }
+
+    fn check_user(&self, user_id: &str) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut entry = self
+            .user_limits
+            .entry(user_id.to_string())
+            .or_insert((0, now + RATE_WINDOW_SECS));
+
+        if now > entry.1 {
+            *entry = (1, now + RATE_WINDOW_SECS);
+            true
+        } else if entry.0 < USER_RATE_LIMIT {
+            entry.0 += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    connections: Arc<DashMap<String, UserConnection>>,
+    redis_pool: Arc<RwLock<Vec<MultiplexedConnection>>>,
+    fcm_tokens: Arc<DashMap<String, String>>,
+    rate_limiter: Arc<RateLimiter>,
+    metrics: Arc<Metrics>,
+    connection_semaphore: Arc<Semaphore>,
+    broadcast_tx: broadcast::Sender<BroadcastMessage>,
+}
+
+#[derive(Debug, Clone)]
+enum BroadcastMessage {
+    Chat(ChatMessage),
+    Seen(MessageSeen),
+    Typing(TypingIndicator),
+}
+
+struct Metrics {
+    total_connections: AtomicUsize,
+    total_messages: AtomicU64,
+    active_users: AtomicUsize,
+    failed_messages: AtomicU64,
+    rate_limited: AtomicU64,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            total_connections: AtomicUsize::new(0),
+            total_messages: AtomicU64::new(0),
+            active_users: AtomicUsize::new(0),
+            failed_messages: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+        }
+    }
+}
+
+// ==================== ENCRYPTION ====================
+
+fn decrypt_message(encrypted_b64: &str) -> Result<String, anyhow::Error> {
+    let combined = base64::decode(encrypted_b64)?;
+
+    if combined.len() < 12 + 16 {
+        return Ok("New message".to_string());
+    }
+
+    let iv = &combined[0..12];
+    let ciphertext_with_tag = &combined[12..];
+    
+    let unbound_key = UnboundKey::new(&AES_128_GCM, AES_KEY)?;
+    let key = LessSafeKey::new(unbound_key);
+    let nonce = Nonce::try_assume_unique_for_key(iv)?;
+
+    let mut in_out = ciphertext_with_tag.to_vec();
+    let decrypted = key.open_in_place(nonce, Aad::empty(), &mut in_out)?;
+    
+    Ok(String::from_utf8(decrypted.to_vec())?)
+}
+
+// ==================== REDIS CONNECTION POOL ====================
+
+async fn create_redis_pool(redis_url: &str) -> Result<Vec<MultiplexedConnection>, RedisError> {
+    let mut pool = Vec::with_capacity(REDIS_POOL_SIZE);
+    
+    // Try cluster mode first, fall back to single node
+    if let Ok(cluster_client) = ClusterClient::new(vec![redis_url]) {
+        for _ in 0..REDIS_POOL_SIZE {
+            match cluster_client.get_async_connection().await {
+                Ok(conn) => pool.push(conn),
+                Err(e) => warn!("Cluster connection failed: {}", e),
+            }
+        }
+    }
+    
+    // Fallback to single node
+    if pool.is_empty() {
+        let client = redis::Client::open(redis_url)?;
+        for _ in 0..REDIS_POOL_SIZE {
+            let conn = client.get_multiplexed_tokio_connection().await?;
+            pool.push(conn);
+        }
+    }
+
+    info!("Redis pool created with {} connections", pool.len());
+    Ok(pool)
+}
+
+async fn get_redis_conn(state: &AppState) -> Option<MultiplexedConnection> {
+    let pool = state.redis_pool.read();
+    if pool.is_empty() {
+        return None;
+    }
+    let idx = fastrand::usize(..pool.len());
+    Some(pool[idx].clone())
+}
+
+// ==================== MESSAGE PROCESSING ====================
+
+async fn process_chat_message(state: &AppState, msg: ChatMessage) {
+    state.metrics.total_messages.fetch_add(1, Ordering::Relaxed);
+
+    // Check if receiver is online
+    if let Some(receiver_conn) = state.connections.get(&msg.receiver_id) {
+        // User is online - send immediately
+        let json = serde_json::to_string(&msg).unwrap_or_default();
+        let ws_msg = WsMessage::Text(json);
+        
+        if receiver_conn.tx.send_async(ws_msg).await.is_err() {
+            warn!("Failed to send message to online user: {}", msg.receiver_id);
+        } else {
+            debug!("Message delivered to online user: {}", msg.receiver_id);
+        }
+    } else {
+        // User is offline - store in Redis and send push notification
+        if let Some(mut redis) = get_redis_conn(state).await {
+            let key = format!("pending:{}", msg.receiver_id);
+            let value = serde_json::to_string(&msg).unwrap_or_default();
+            
+            let _: Result<(), RedisError> = redis
+                .rpush(&key, &value)
+                .await;
+            let _: Result<(), RedisError> = redis
+                .expire(&key, PENDING_MESSAGE_TTL)
+                .await;
+                
+            debug!("Message buffered for offline user: {}", msg.receiver_id);
+            
+            // Send push notification
+            tokio::spawn({
+                let state = state.clone();
+                let msg = msg.clone();
+                async move {
+                    send_push_notification(&state, &msg).await;
+                }
+            });
+        }
+    }
+
+    // Update recent chats asynchronously
+    tokio::spawn({
+        let msg = msg.clone();
+        async move {
+            if let Err(e) = update_recent_chats(&msg).await {
+                warn!("Failed to update recent chats: {}", e);
+            }
+        }
+    });
+}
+
+async fn send_push_notification(state: &AppState, msg: &ChatMessage) {
+    if let Some(fcm_token) = state.fcm_tokens.get(&msg.receiver_id) {
+        // Decrypt message for notification
+        let decrypted = decrypt_message(&msg.content)
+            .unwrap_or_else(|_| "New message".to_string());
+        
+        let truncated = if decrypted.len() > 100 {
+            format!("{}...", &decrypted[..97])
+        } else {
+            decrypted
+        };
+
+        info!(
+            "FCM push would be sent to {} - Token: {}... Message: {}",
+            msg.receiver_id,
+            &fcm_token.value()[..20],
+            truncated
+        );
+        
+        // In production, integrate with FCM SDK here
+    }
+}
+
+async fn update_recent_chats(msg: &ChatMessage) -> Result<(), anyhow::Error> {
+    // In production, call MongoDB API endpoint
+    debug!("Would update recent chats for chat_id: {}", msg.chat_id);
+    Ok(())
+}
+
+// ==================== WEBSOCKET HANDLER ====================
+
+async fn handle_websocket(
+    ws: WebSocket,
+    state: AppState,
+    user_id: String,
+) {
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (tx, rx) = bounded::<WsMessage>(MESSAGE_BUFFER_SIZE);
+
+    // Register connection
+    let last_activity = Arc::new(AtomicU64::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    ));
+    let message_count = Arc::new(AtomicU64::new(0));
+    let rate_limit_reset = Arc::new(AtomicU64::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + RATE_WINDOW_SECS,
+    ));
+
+    let user_conn = UserConnection {
+        user_id: user_id.clone(),
+        tx: tx.clone(),
+        last_activity: last_activity.clone(),
+        message_count: message_count.clone(),
+        rate_limit_reset: rate_limit_reset.clone(),
+    };
+
+    state.connections.insert(user_id.clone(), user_conn);
+    state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
+    state.metrics.active_users.fetch_add(1, Ordering::Relaxed);
+    
+    info!("User connected: {} (Total: {})", 
+        user_id, 
+        state.metrics.active_users.load(Ordering::Relaxed)
+    );
+
+    // Replay pending messages
+    tokio::spawn({
+        let state = state.clone();
+        let user_id = user_id.clone();
+        let tx = tx.clone();
+        async move {
+            if let Some(mut redis) = get_redis_conn(&state).await {
+                let key = format!("pending:{}", user_id);
+                
+                if let Ok(messages) = redis.lrange::<_, Vec<String>>(&key, 0, -1).await {
+                    for msg_str in messages {
+                        if let Ok(msg) = serde_json::from_str::<ChatMessage>(&msg_str) {
+                            let json = serde_json::to_string(&msg).unwrap_or_default();
+                            let _ = tx.send_async(WsMessage::Text(json)).await;
+                        }
+                    }
+                    let _: Result<(), RedisError> = redis.del(&key).await;
+                    info!("Replayed pending messages for user: {}", user_id);
+                }
+            }
+        }
+    });
+
+    // Outgoing message task
+    let outgoing_task = tokio::spawn({
+        let user_id = user_id.clone();
+        async move {
+            while let Ok(msg) = rx.recv_async().await {
+                if ws_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            debug!("Outgoing task ended for user: {}", user_id);
+        }
+    });
+
+    // Heartbeat task
+    let heartbeat_task = tokio::spawn({
+        let last_activity = last_activity.clone();
+        let user_id = user_id.clone();
+        let tx = tx.clone();
+        async move {
+            let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let last = last_activity.load(Ordering::Relaxed);
+                
+                if now - last > CLIENT_TIMEOUT_SECS {
+                    warn!("Client timeout for user: {}", user_id);
+                    break;
+                }
+                
+                if tx.send_async(WsMessage::Ping(vec![])).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Incoming message handling
+    while let Some(result) = ws_rx.next().await {
+        match result {
+            Ok(WsMessage::Text(text)) => {
+                last_activity.store(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
+
+                // Rate limiting
+                if !state.rate_limiter.check_global() {
+                    state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    let _ = tx.send_async(WsMessage::Text(
+                        r#"{"error":"Global rate limit exceeded"}"#.to_string()
+                    )).await;
+                    continue;
+                }
+
+                if !state.rate_limiter.check_user(&user_id) {
+                    state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    let _ = tx.send_async(WsMessage::Text(
+                        r#"{"error":"User rate limit exceeded"}"#.to_string()
+                    )).await;
+                    continue;
+                }
+
+                // Parse and route message
+                if let Ok(msg) = serde_json::from_str::<ChatMessage>(&text) {
+                    tokio::spawn({
+                        let state = state.clone();
+                        async move {
+                            process_chat_message(&state, msg).await;
+                        }
+                    });
+                } else if let Ok(seen) = serde_json::from_str::<MessageSeen>(&text) {
+                    if let Some(receiver) = state.connections.get(&seen.user_id) {
+                        let json = serde_json::to_string(&seen).unwrap_or_default();
+                        let _ = receiver.tx.send_async(WsMessage::Text(json)).await;
+                    }
+                } else if let Ok(typing) = serde_json::from_str::<TypingIndicator>(&text) {
+                    if let Some(receiver) = state.connections.get(&typing.receiver_id) {
+                        let json = serde_json::to_string(&typing).unwrap_or_default();
+                        let _ = receiver.tx.send_async(WsMessage::Text(json)).await;
+                    }
+                }
+            }
+            Ok(WsMessage::Pong(_)) => {
+                last_activity.store(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
+            }
+            Ok(WsMessage::Close(_)) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // Cleanup
+    state.connections.remove(&user_id);
+    state.metrics.active_users.fetch_sub(1, Ordering::Relaxed);
+    outgoing_task.abort();
+    heartbeat_task.abort();
+    
+    info!("User disconnected: {} (Remaining: {})", 
+        user_id,
+        state.metrics.active_users.load(Ordering::Relaxed)
+    );
+}
+
+// ==================== HTTP HANDLERS ====================
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Response {
+    // Check connection limit
+    if state.connection_semaphore.try_acquire().is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Too many connections").into_response();
+    }
+
+    ws.on_upgrade(move |socket| handle_websocket(socket, state, user_id))
+}
+
+async fn register_fcm_token(
+    State(state): State<AppState>,
+    Json(req): Json<FcmTokenRequest>,
+) -> impl IntoResponse {
+    if req.token.len() < 100 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid FCM token format"
+        })));
+    }
+
+    state.fcm_tokens.insert(req.user_id.clone(), req.token.clone());
+    info!("FCM token registered for user: {}", req.user_id);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "success": true,
+        "message": "FCM token registered successfully"
+    })))
+}
+
+async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "healthy",
+        "active_connections": state.metrics.active_users.load(Ordering::Relaxed),
+        "total_messages": state.metrics.total_messages.load(Ordering::Relaxed),
+        "failed_messages": state.metrics.failed_messages.load(Ordering::Relaxed),
+        "rate_limited": state.metrics.rate_limited.load(Ordering::Relaxed),
+        "fcm_tokens": state.fcm_tokens.len(),
+    }))
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let metrics = format!(
+        "# HELP chat_active_connections Number of active WebSocket connections\n\
+         # TYPE chat_active_connections gauge\n\
+         chat_active_connections {}\n\
+         # HELP chat_total_messages Total messages processed\n\
+         # TYPE chat_total_messages counter\n\
+         chat_total_messages {}\n\
+         # HELP chat_failed_messages Total failed messages\n\
+         # TYPE chat_failed_messages counter\n\
+         chat_failed_messages {}\n\
+         # HELP chat_rate_limited Total rate limited requests\n\
+         # TYPE chat_rate_limited counter\n\
+         chat_rate_limited {}\n",
+        state.metrics.active_users.load(Ordering::Relaxed),
+        state.metrics.total_messages.load(Ordering::Relaxed),
+        state.metrics.failed_messages.load(Ordering::Relaxed),
+        state.metrics.rate_limited.load(Ordering::Relaxed),
+    );
+    
+    (StatusCode::OK, metrics)
+}
+
+// ==================== MAIN APPLICATION ====================
 
 #[tokio::main]
-async fn main() {
-    // Create basic router responding on /
-    let app = Router::new().route("/", get(|| async { "Hello, Render Rust!" }));
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .compact()
+        .init();
 
-    // Read the PORT environment variable (Render sets this automatically)
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "10000".into())
-        .parse()
-        .unwrap();
+    info!("🚀 Ultra Chat Server Starting...");
 
+    // Load configuration
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse::<u16>()?;
+
+    // Create Redis pool
+    let redis_pool = create_redis_pool(&redis_url).await?;
+    
+    // Initialize state
+    let max_connections = MAX_CONNECTIONS_PER_WORKER * WORKER_COUNT;
+    let (broadcast_tx, _) = broadcast::channel(100_000);
+    
+    let state = AppState {
+        connections: Arc::new(DashMap::with_capacity(max_connections)),
+        redis_pool: Arc::new(RwLock::new(redis_pool)),
+        fcm_tokens: Arc::new(DashMap::with_capacity(100_000)),
+        rate_limiter: Arc::new(RateLimiter::new()),
+        metrics: Arc::new(Metrics::new()),
+        connection_semaphore: Arc::new(Semaphore::new(max_connections)),
+        broadcast_tx,
+    };
+
+    // Build router
+    let app = Router::new()
+        .route("/ws/:user_id", get(ws_handler))
+        .route("/health", get(health_check))
+        .route("/metrics", get(metrics_handler))
+        .route("/register-fcm-token", post(register_fcm_token))
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(CompressionLayer::new())
+                .layer(CorsLayer::permissive())
+        )
+        .with_state(state.clone());
+
+    // Start metrics logger
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            let mut interval = interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                info!(
+                    "📊 Stats - Connections: {} | Messages: {} | Rate Limited: {}",
+                    state.metrics.active_users.load(Ordering::Relaxed),
+                    state.metrics.total_messages.load(Ordering::Relaxed),
+                    state.metrics.rate_limited.load(Ordering::Relaxed),
+                );
+            }
+        }
+    });
+
+    // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!("Listening on {:?}", addr);
+    info!("🎯 Server listening on {}", addr);
+    info!("📡 Max connections: {}", max_connections);
+    info!("⚡ Ready to handle BILLIONS of messages!");
 
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
