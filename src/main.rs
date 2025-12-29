@@ -271,19 +271,28 @@ fn get_redis_conn(state: &AppState) -> Option<ConnectionManager> {
 // ==================== SOCKET.IO HANDLERS ====================
 
 async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>) {
-    info!("🟢 Socket connected: {}", socket.id);
+    let socket_id = socket.id.to_string();
+    info!("🟢 Socket connected: {} (Transport: {:?})", socket_id, socket.transport_type());
     
     state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
     
-    // Register handler
+    // CRITICAL: Log the connection details for debugging
+    info!("🔍 Connection details: ID={}, Namespaces={:?}", socket_id, socket.ns());
+    
+// Register handler
     socket.on(
         "register",
         |socket: SocketRef, Data::<String>(user_id), SocketState(state): SocketState<AppState>| async move {
             info!("📝 User registered: {} -> {}", user_id, socket.id);
             
+            // CRITICAL FIX: Increment active users when they register
+            state.metrics.active_users.fetch_add(1, Ordering::Relaxed);
+            
             // Store user_id -> socket_id mapping
             state.user_sockets.insert(user_id.clone(), socket.id.to_string());
-            state.metrics.active_users.fetch_add(1, Ordering::Relaxed);
+            
+            info!("📊 Active users after registration: {}", 
+                  state.metrics.active_users.load(Ordering::Relaxed));
             
             // Replay pending messages from Redis
             if let Some(mut redis) = get_redis_conn(&state) {
@@ -298,11 +307,18 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
                     info!("📬 Replayed pending messages for user: {}", user_id);
                 }
             }
+            
+            // Send confirmation back to client
+            let _ = socket.emit("registered", serde_json::json!({
+                "success": true,
+                "userId": user_id,
+                "socketId": socket.id.to_string()
+            }));
         },
     );
     
     // Chat message handler
-    socket.on(
+  socket.on(
         "chat message",
         |socket: SocketRef, Data::<ChatMessage>(msg), SocketState(state): SocketState<AppState>| async move {
             info!("📨 Message received: {} from {} to {}", msg.message_id, msg.sender_id, msg.receiver_id);
@@ -322,24 +338,32 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
             
             state.metrics.total_messages.fetch_add(1, Ordering::Relaxed);
             
+            // CRITICAL FIX: Always emit acknowledgment to sender first
+            let _ = socket.emit("chat message", serde_json::json!({
+                "status": "delivered",
+                "messageId": msg.message_id
+            }));
+            
+            info!("✅ Sent acknowledgment for message: {}", msg.message_id);
+            
             // Check if receiver is online
             if let Some(receiver_socket_id) = state.user_sockets.get(&msg.receiver_id) {
-                // Broadcast to receiver
-                let _ = socket.to(receiver_socket_id.value().to_string()).emit("chat message", msg.clone());
-                debug!("✅ Message delivered to online user: {}", msg.receiver_id);
+                let receiver_id_str = receiver_socket_id.value().to_string();
+                info!("📤 Sending message to receiver socket: {}", receiver_id_str);
+                
+                // Send to specific receiver socket
+                let _ = socket.within(receiver_id_str).emit("chat message", msg.clone());
+                
+                info!("✅ Message delivered to online user: {}", msg.receiver_id);
             } else {
+                info!("📦 Receiver {} offline, storing message", msg.receiver_id);
+                
                 // User offline, store in Redis
                 store_pending_message(&state, &msg).await;
                 
                 // Send push notification
                 send_push_notification(&state, &msg).await;
             }
-            
-            // Send acknowledgment to sender
-            let _ = socket.emit("chat message", serde_json::json!({
-                "status": "delivered",
-                "messageId": msg.message_id
-            }));
         },
     );
     
@@ -528,19 +552,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register Socket.IO event handlers
     io.ns("/", on_connect);
     
-    io.ns("/", |socket: SocketRef, SocketState(state): SocketState<AppState>| async move {
+io.ns("/", |socket: SocketRef, SocketState(state): SocketState<AppState>| async move {
         let socket_id = socket.id.to_string();
+        let state_clone = state.clone();
         
         socket.on_disconnect(move |_socket: SocketRef| async move {
             info!("🔴 Socket disconnected: {}", socket_id);
             
             // Remove from user_sockets mapping
-            state.user_sockets.retain(|_, v| v != &socket_id);
-            state.metrics.active_users.fetch_sub(1, Ordering::Relaxed);
+            state_clone.user_sockets.retain(|_, v| v != &socket_id);
+            
+            // CRITICAL FIX: Only decrement if count is greater than 0
+            let current = state_clone.metrics.active_users.load(Ordering::Relaxed);
+            if current > 0 {
+                state_clone.metrics.active_users.fetch_sub(1, Ordering::Relaxed);
+            }
             
             info!(
                 "📊 Remaining connections: {}",
-                state.metrics.active_users.load(Ordering::Relaxed)
+                state_clone.metrics.active_users.load(Ordering::Relaxed)
             );
         });
     });
