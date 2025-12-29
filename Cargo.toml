@@ -20,6 +20,7 @@ flume = "0.11"
 ring = "0.17"
 base64 = "0.22"
 rand = "0.8"
+socketioxide = { version = "0.14", features = ["state"] }
 
 [profile.release]
 opt-level = 3
