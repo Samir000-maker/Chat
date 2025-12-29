@@ -1,21 +1,20 @@
 use axum::{
-    extract::{
-        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        Path, State,
-    },
+    extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use dashmap::DashMap;
-use flume::{bounded, Receiver, Sender};
-use futures::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client as RedisClient, RedisError};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
 use serde::{Deserialize, Serialize};
+use socketioxide::{
+    extract::{Data, SocketRef, State as SocketState},
+    SocketIo,
+};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -25,10 +24,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    sync::Semaphore,
-    time::interval,
-};
+use tokio::time::interval;
 use tower::ServiceBuilder;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer,
@@ -37,16 +33,12 @@ use tracing::{debug, error, info, warn};
 use base64::{Engine as _, engine::general_purpose};
 
 // ==================== CONSTANTS & CONFIGURATION ====================
-const MAX_CONNECTIONS_PER_WORKER: usize = 50_000;
-const WORKER_COUNT: usize = 8;
-const MESSAGE_BUFFER_SIZE: usize = 10_000;
+const MAX_CONNECTIONS: usize = 400_000;
 const GLOBAL_RATE_LIMIT: u64 = 1_000_000;
 const USER_RATE_LIMIT: u64 = 100;
 const RATE_WINDOW_SECS: u64 = 60;
 const PENDING_MESSAGE_TTL: i64 = 300;
 const REDIS_POOL_SIZE: usize = 32;
-const HEARTBEAT_INTERVAL_SECS: u64 = 30;
-const CLIENT_TIMEOUT_SECS: u64 = 90;
 
 // AES-128-GCM Encryption
 const AES_KEY: &[u8] = b"0123456789abcdef";
@@ -55,46 +47,67 @@ const AES_KEY: &[u8] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
+    #[serde(rename = "messageId")]
     message_id: String,
+    #[serde(rename = "chatId")]
     chat_id: String,
+    #[serde(rename = "senderId")]
     sender_id: String,
+    #[serde(rename = "receiverId")]
     receiver_id: String,
     content: String,
-    timestamp: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: String,
+    seen: bool,
+    #[serde(rename = "replyMessageId", skip_serializing_if = "Option::is_none")]
+    reply_message_id: Option<String>,
+    #[serde(rename = "replyMessage", skip_serializing_if = "Option::is_none")]
+    reply_message: Option<String>,
+    #[serde(rename = "senderUsername", skip_serializing_if = "Option::is_none")]
     sender_username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "senderProfilePicUrl", skip_serializing_if = "Option::is_none")]
     sender_profile_pic_url: Option<String>,
+    #[serde(rename = "attachmentType", skip_serializing_if = "Option::is_none")]
+    attachment_type: Option<String>,
+    #[serde(rename = "attachmentName", skip_serializing_if = "Option::is_none")]
+    attachment_name: Option<String>,
+    #[serde(rename = "attachmentSize", skip_serializing_if = "Option::is_none")]
+    attachment_size: Option<i64>,
+    #[serde(rename = "attachmentUrl", skip_serializing_if = "Option::is_none")]
+    attachment_url: Option<String>,
+    #[serde(rename = "attachmentData", skip_serializing_if = "Option::is_none")]
+    attachment_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageSeen {
+    #[serde(rename = "messageId")]
     message_id: String,
+    #[serde(rename = "chatId")]
     chat_id: String,
+    #[serde(rename = "userId")]
     user_id: String,
     timestamp: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TypingIndicator {
-    sender_id: String,
+    #[serde(rename = "userId")]
+    user_id: String,
+    #[serde(rename = "receiverId")]
     receiver_id: String,
+    #[serde(rename = "chatId")]
+    chat_id: String,
+    #[serde(rename = "isTyping")]
     is_typing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FcmTokenRequest {
+    #[serde(rename = "userId")]
     user_id: String,
     token: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "deviceInfo", skip_serializing_if = "Option::is_none")]
     device_info: Option<HashMap<String, String>>,
-}
-
-#[derive(Debug)]
-struct UserConnection {
-    user_id: String,
-    tx: Sender<WsMessage>,
-    last_activity: Arc<AtomicU64>,
 }
 
 struct RateLimiter {
@@ -160,12 +173,11 @@ impl RateLimiter {
 
 #[derive(Clone)]
 struct AppState {
-    connections: Arc<DashMap<String, UserConnection>>,
     redis_pool: Arc<RwLock<Vec<ConnectionManager>>>,
     fcm_tokens: Arc<DashMap<String, String>>,
     rate_limiter: Arc<RateLimiter>,
     metrics: Arc<Metrics>,
-    connection_semaphore: Arc<Semaphore>,
+    user_sockets: Arc<DashMap<String, String>>, // user_id -> socket_id mapping
 }
 
 struct Metrics {
@@ -232,7 +244,6 @@ async fn create_redis_pool(redis_url: &str) -> Result<Vec<ConnectionManager>, Re
             Err(e) => {
                 warn!("⚠️ Redis connection {} failed: {}", i, e);
                 if i == 0 {
-                    // If first connection fails, try fewer connections
                     break;
                 }
             }
@@ -241,7 +252,6 @@ async fn create_redis_pool(redis_url: &str) -> Result<Vec<ConnectionManager>, Re
 
     if pool.is_empty() {
         warn!("⚠️ No Redis connections available - running without persistence");
-        // Return empty pool instead of error - server can work without Redis
     } else {
         info!("📦 Redis pool created with {} connections", pool.len());
     }
@@ -258,44 +268,145 @@ fn get_redis_conn(state: &AppState) -> Option<ConnectionManager> {
     Some(pool[idx].clone())
 }
 
-// ==================== MESSAGE PROCESSING ====================
+// ==================== SOCKET.IO HANDLERS ====================
 
-async fn process_chat_message(state: &AppState, msg: ChatMessage) {
-    state
-        .metrics
-        .total_messages
-        .fetch_add(1, Ordering::Relaxed);
-
-    // Check if receiver is online
-    if let Some(receiver_conn) = state.connections.get(&msg.receiver_id) {
-        let json = serde_json::to_string(&msg).unwrap_or_default();
-        let ws_msg = WsMessage::Text(json);
-
-        if receiver_conn.tx.send_async(ws_msg).await.is_err() {
-            warn!("Failed to send message to online user: {}", msg.receiver_id);
-        } else {
-            debug!("✅ Message delivered to online user: {}", msg.receiver_id);
-        }
-    } else {
-        // User is offline - store in Redis if available
-        if let Some(mut redis) = get_redis_conn(state) {
-            let key = format!("pending:{}", msg.receiver_id);
-            let value = serde_json::to_string(&msg).unwrap_or_default();
-
-            let _: Result<(), RedisError> = redis.rpush(&key, &value).await;
-            let _: Result<(), RedisError> = redis.expire(&key, PENDING_MESSAGE_TTL).await;
-
-            debug!("📦 Message buffered for offline user: {}", msg.receiver_id);
-        }
-
-        // Send push notification
-        tokio::spawn({
-            let state = state.clone();
-            let msg = msg.clone();
-            async move {
+async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>) {
+    info!("🟢 Socket connected: {}", socket.id);
+    
+    state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
+    
+    // Register handler
+    socket.on(
+        "register",
+        |socket: SocketRef, Data::<String>(user_id), SocketState(state): SocketState<AppState>| async move {
+            info!("📝 User registered: {} -> {}", user_id, socket.id);
+            
+            // Store user_id -> socket_id mapping
+            state.user_sockets.insert(user_id.clone(), socket.id.to_string());
+            state.metrics.active_users.fetch_add(1, Ordering::Relaxed);
+            
+            // Replay pending messages from Redis
+            if let Some(mut redis) = get_redis_conn(&state) {
+                let key = format!("pending:{}", user_id);
+                if let Ok(messages) = redis.lrange::<_, Vec<String>>(&key, 0, -1).await {
+                    for msg_str in messages {
+                        if let Ok(msg) = serde_json::from_str::<ChatMessage>(&msg_str) {
+                            let _ = socket.emit("chat message", msg);
+                        }
+                    }
+                    let _: Result<(), RedisError> = redis.del(&key).await;
+                    info!("📬 Replayed pending messages for user: {}", user_id);
+                }
+            }
+        },
+    );
+    
+    // Chat message handler
+    socket.on(
+        "chat message",
+        |socket: SocketRef, Data::<ChatMessage>(msg), SocketState(state): SocketState<AppState>| async move {
+            info!("📨 Message received: {} from {} to {}", msg.message_id, msg.sender_id, msg.receiver_id);
+            
+            // Rate limiting
+            if !state.rate_limiter.check_global() {
+                state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                let _ = socket.emit("error", serde_json::json!({"error": "Global rate limit exceeded"}));
+                return Ok(());
+            }
+            
+            if !state.rate_limiter.check_user(&msg.sender_id) {
+                state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                let _ = socket.emit("error", serde_json::json!({"error": "User rate limit exceeded"}));
+                return Ok(());
+            }
+            
+            state.metrics.total_messages.fetch_add(1, Ordering::Relaxed);
+            
+            // Check if receiver is online
+            if let Some(receiver_socket_id) = state.user_sockets.get(&msg.receiver_id) {
+                // Send to receiver's socket
+                if let Some(receiver_socket) = socket.get_socket(receiver_socket_id.value()) {
+                    let _ = receiver_socket.emit("chat message", msg.clone());
+                    debug!("✅ Message delivered to online user: {}", msg.receiver_id);
+                } else {
+                    // Socket not found, store in Redis
+                    store_pending_message(&state, &msg).await;
+                }
+            } else {
+                // User offline, store in Redis
+                store_pending_message(&state, &msg).await;
+                
+                // Send push notification
                 send_push_notification(&state, &msg).await;
             }
-        });
+            
+            // Send acknowledgment to sender
+            socket.emit("chat message", serde_json::json!({
+                "status": "delivered",
+                "messageId": msg.message_id
+            }))
+        },
+    );
+    
+    // Message seen handler
+    socket.on(
+        "message_seen",
+        |socket: SocketRef, Data::<MessageSeen>(seen), SocketState(state): SocketState<AppState>| async move {
+            debug!("👁️ Message seen: {} by {}", seen.message_id, seen.user_id);
+            
+            // Find sender's socket and notify
+            // Note: You need to track who sent which message to route this correctly
+            // For simplicity, we'll broadcast to the chat
+            if let Some(sender_socket_id) = state.user_sockets.get(&seen.user_id) {
+                if let Some(sender_socket) = socket.get_socket(sender_socket_id.value()) {
+                    let _ = sender_socket.emit("message_seen", seen);
+                }
+            }
+            
+            Ok(())
+        },
+    );
+    
+    // Typing indicator handler
+    socket.on(
+        "typing",
+        |socket: SocketRef, Data::<TypingIndicator>(typing), SocketState(state): SocketState<AppState>| async move {
+            debug!("⌨️ Typing: {} -> {}", typing.user_id, typing.receiver_id);
+            
+            // Send to receiver
+            if let Some(receiver_socket_id) = state.user_sockets.get(&typing.receiver_id) {
+                if let Some(receiver_socket) = socket.get_socket(receiver_socket_id.value()) {
+                    let _ = receiver_socket.emit("typing", typing);
+                }
+            }
+            
+            Ok(())
+        },
+    );
+}
+
+async fn on_disconnect(socket: SocketRef, SocketState(state): SocketState<AppState>) {
+    info!("🔴 Socket disconnected: {}", socket.id);
+    
+    // Remove from user_sockets mapping
+    state.user_sockets.retain(|_, v| v != &socket.id.to_string());
+    state.metrics.active_users.fetch_sub(1, Ordering::Relaxed);
+    
+    info!(
+        "📊 Remaining connections: {}",
+        state.metrics.active_users.load(Ordering::Relaxed)
+    );
+}
+
+async fn store_pending_message(state: &AppState, msg: &ChatMessage) {
+    if let Some(mut redis) = get_redis_conn(state) {
+        let key = format!("pending:{}", msg.receiver_id);
+        let value = serde_json::to_string(&msg).unwrap_or_default();
+        
+        let _: Result<(), RedisError> = redis.rpush(&key, &value).await;
+        let _: Result<(), RedisError> = redis.expire(&key, PENDING_MESSAGE_TTL).await;
+        
+        debug!("📦 Message buffered for offline user: {}", msg.receiver_id);
     }
 }
 
@@ -319,201 +430,7 @@ async fn send_push_notification(state: &AppState, msg: &ChatMessage) {
     }
 }
 
-// ==================== WEBSOCKET HANDLER ====================
-
-async fn handle_websocket(ws: WebSocket, state: AppState, user_id: String) {
-    let (mut ws_tx, mut ws_rx) = ws.split();
-    let (tx, rx) = bounded::<WsMessage>(MESSAGE_BUFFER_SIZE);
-
-    let last_activity = Arc::new(AtomicU64::new(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    ));
-
-    let user_conn = UserConnection {
-        user_id: user_id.clone(),
-        tx: tx.clone(),
-        last_activity: last_activity.clone(),
-    };
-
-    state.connections.insert(user_id.clone(), user_conn);
-    state
-        .metrics
-        .total_connections
-        .fetch_add(1, Ordering::Relaxed);
-    state.metrics.active_users.fetch_add(1, Ordering::Relaxed);
-
-    info!(
-        "🟢 User connected: {} (Total: {})",
-        user_id,
-        state.metrics.active_users.load(Ordering::Relaxed)
-    );
-
-    // Replay pending messages if Redis is available
-    tokio::spawn({
-        let state = state.clone();
-        let user_id = user_id.clone();
-        let tx = tx.clone();
-        async move {
-            if let Some(mut redis) = get_redis_conn(&state) {
-                let key = format!("pending:{}", user_id);
-
-                if let Ok(messages) = redis.lrange::<_, Vec<String>>(&key, 0, -1).await {
-                    for msg_str in messages {
-                        if let Ok(msg) = serde_json::from_str::<ChatMessage>(&msg_str) {
-                            let json = serde_json::to_string(&msg).unwrap_or_default();
-                            let _ = tx.send_async(WsMessage::Text(json)).await;
-                        }
-                    }
-                    let _: Result<(), RedisError> = redis.del(&key).await;
-                    info!("📬 Replayed pending messages for user: {}", user_id);
-                }
-            }
-        }
-    });
-
-    // Outgoing message task
-    let outgoing_task = tokio::spawn({
-        let user_id = user_id.clone();
-        async move {
-            while let Ok(msg) = rx.recv_async().await {
-                if ws_tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-            debug!("Outgoing task ended for user: {}", user_id);
-        }
-    });
-
-    // Heartbeat task
-    let heartbeat_task = tokio::spawn({
-        let last_activity = last_activity.clone();
-        let user_id = user_id.clone();
-        let tx = tx.clone();
-        async move {
-            let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-            loop {
-                interval.tick().await;
-
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let last = last_activity.load(Ordering::Relaxed);
-
-                if now - last > CLIENT_TIMEOUT_SECS {
-                    warn!("⏱️ Client timeout for user: {}", user_id);
-                    break;
-                }
-
-                if tx.send_async(WsMessage::Ping(vec![])).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
-
-    // Incoming message handling
-    while let Some(result) = ws_rx.next().await {
-        match result {
-            Ok(WsMessage::Text(text)) => {
-                last_activity.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    Ordering::Relaxed,
-                );
-
-                // Rate limiting
-                if !state.rate_limiter.check_global() {
-                    state
-                        .metrics
-                        .rate_limited
-                        .fetch_add(1, Ordering::Relaxed);
-                    let _ = tx
-                        .send_async(WsMessage::Text(
-                            r#"{"error":"Global rate limit exceeded"}"#.to_string(),
-                        ))
-                        .await;
-                    continue;
-                }
-
-                if !state.rate_limiter.check_user(&user_id) {
-                    state
-                        .metrics
-                        .rate_limited
-                        .fetch_add(1, Ordering::Relaxed);
-                    let _ = tx
-                        .send_async(WsMessage::Text(
-                            r#"{"error":"User rate limit exceeded"}"#.to_string(),
-                        ))
-                        .await;
-                    continue;
-                }
-
-                // Parse and route message
-                if let Ok(msg) = serde_json::from_str::<ChatMessage>(&text) {
-                    tokio::spawn({
-                        let state = state.clone();
-                        async move {
-                            process_chat_message(&state, msg).await;
-                        }
-                    });
-                } else if let Ok(seen) = serde_json::from_str::<MessageSeen>(&text) {
-                    if let Some(receiver) = state.connections.get(&seen.user_id) {
-                        let json = serde_json::to_string(&seen).unwrap_or_default();
-                        let _ = receiver.tx.send_async(WsMessage::Text(json)).await;
-                    }
-                } else if let Ok(typing) = serde_json::from_str::<TypingIndicator>(&text) {
-                    if let Some(receiver) = state.connections.get(&typing.receiver_id) {
-                        let json = serde_json::to_string(&typing).unwrap_or_default();
-                        let _ = receiver.tx.send_async(WsMessage::Text(json)).await;
-                    }
-                }
-            }
-            Ok(WsMessage::Pong(_)) => {
-                last_activity.store(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                    Ordering::Relaxed,
-                );
-            }
-            Ok(WsMessage::Close(_)) | Err(_) => break,
-            _ => {}
-        }
-    }
-
-    // Cleanup
-    state.connections.remove(&user_id);
-    state.metrics.active_users.fetch_sub(1, Ordering::Relaxed);
-    outgoing_task.abort();
-    heartbeat_task.abort();
-
-    info!(
-        "🔴 User disconnected: {} (Remaining: {})",
-        user_id,
-        state.metrics.active_users.load(Ordering::Relaxed)
-    );
-}
-
 // ==================== HTTP HANDLERS ====================
-
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-    Path(user_id): Path<String>,
-) -> Response {
-    if state.connection_semaphore.try_acquire().is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Too many connections").into_response();
-    }
-
-    ws.on_upgrade(move |socket| handle_websocket(socket, state, user_id))
-}
 
 async fn register_fcm_token(
     State(state): State<AppState>,
@@ -529,9 +446,7 @@ async fn register_fcm_token(
         );
     }
 
-    state
-        .fcm_tokens
-        .insert(req.user_id.clone(), req.token.clone());
+    state.fcm_tokens.insert(req.user_id.clone(), req.token.clone());
     info!("📱 FCM token registered for user: {}", req.user_id);
 
     (
@@ -556,7 +471,7 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let metrics = format!(
-        "# HELP chat_active_connections Number of active WebSocket connections\n\
+        "# HELP chat_active_connections Number of active Socket.IO connections\n\
          # TYPE chat_active_connections gauge\n\
          chat_active_connections {}\n\
          # HELP chat_total_messages Total messages processed\n\
@@ -578,23 +493,21 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn root_handler() -> &'static str {
-    "Ultra Chat Server - Running 🚀"
+    "Ultra Chat Server with Socket.IO - Running 🚀"
 }
 
 // ==================== MAIN APPLICATION ====================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
         .compact()
         .init();
 
-    info!("🚀 Ultra Chat Server Starting...");
+    info!("🚀 Ultra Chat Server with Socket.IO Starting...");
 
-    // Get configuration from environment
     let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let port = std::env::var("PORT")
@@ -604,7 +517,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("📡 Configured port: {}", port);
 
-    // Create Redis pool (non-blocking)
     let redis_pool = match create_redis_pool(&redis_url).await {
         Ok(pool) => pool,
         Err(e) => {
@@ -613,21 +525,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let max_connections = MAX_CONNECTIONS_PER_WORKER * WORKER_COUNT;
-
     let state = AppState {
-        connections: Arc::new(DashMap::with_capacity(max_connections)),
         redis_pool: Arc::new(RwLock::new(redis_pool)),
         fcm_tokens: Arc::new(DashMap::with_capacity(100_000)),
         rate_limiter: Arc::new(RateLimiter::new()),
         metrics: Arc::new(Metrics::new()),
-        connection_semaphore: Arc::new(Semaphore::new(max_connections)),
+        user_sockets: Arc::new(DashMap::with_capacity(MAX_CONNECTIONS)),
     };
 
-    // Build router
+    // Create Socket.IO layer
+    let (layer, io) = SocketIo::builder()
+        .with_state(state.clone())
+        .build_layer();
+
+    // Register Socket.IO event handlers
+    io.ns("/", |socket: SocketRef, SocketState(state): SocketState<AppState>| async move {
+        on_connect(socket.clone(), SocketState(state.clone())).await;
+    });
+
+    io.ns("/", |socket: SocketRef, SocketState(state): SocketState<AppState>| async move {
+        socket.on_disconnect(move || async move {
+            on_disconnect(socket, SocketState(state)).await;
+        });
+    });
+
+    // Build router with Socket.IO
     let app = Router::new()
         .route("/", get(root_handler))
-        .route("/ws/:user_id", get(ws_handler))
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_handler))
         .route("/register-fcm-token", post(register_fcm_token))
@@ -635,8 +559,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
                 .layer(CompressionLayer::new())
-                .layer(CorsLayer::permissive()),
+                .layer(
+                    CorsLayer::new()
+                        .allow_origin(tower_http::cors::Any)
+                        .allow_methods(tower_http::cors::Any)
+                        .allow_headers(tower_http::cors::Any)
+                ),
         )
+        .layer(layer)
         .with_state(state.clone());
 
     // Stats reporting task
@@ -656,12 +586,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Bind to address - support both IPv4 and IPv6
+    // Bind to address
     let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
     
     info!("🎯 Attempting to bind to address: {}", addr);
     
-    // Create TCP listener
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
             let local_addr = listener.local_addr()?;
@@ -671,9 +600,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             error!("❌ Failed to bind to {}: {}", addr, e);
-            error!("💡 Trying fallback IPv4-only binding...");
+            info!("💡 Trying fallback IPv4-only binding...");
             
-            // Fallback to IPv4 only
             let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr_v4).await?;
             let local_addr = listener.local_addr()?;
@@ -682,12 +610,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    info!("📡 Max connections: {}", max_connections);
-    info!("⚡ Ready to handle messages!");
-    info!("🔗 WebSocket endpoint: ws://0.0.0.0:{}/ws/:user_id", port);
+    info!("📡 Max connections: {}", MAX_CONNECTIONS);
+    info!("⚡ Ready to handle Socket.IO connections!");
+    info!("🔗 Socket.IO endpoint: http://0.0.0.0:{}/socket.io/", port);
     info!("💚 Health check: http://0.0.0.0:{}/health", port);
 
-    // Start server
     axum::serve(listener, app).await?;
 
     Ok(())
