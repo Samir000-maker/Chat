@@ -311,27 +311,22 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
             if !state.rate_limiter.check_global() {
                 state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                 let _ = socket.emit("error", serde_json::json!({"error": "Global rate limit exceeded"}));
-                return Ok(());
+                return;
             }
             
             if !state.rate_limiter.check_user(&msg.sender_id) {
                 state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                 let _ = socket.emit("error", serde_json::json!({"error": "User rate limit exceeded"}));
-                return Ok(());
+                return;
             }
             
             state.metrics.total_messages.fetch_add(1, Ordering::Relaxed);
             
             // Check if receiver is online
             if let Some(receiver_socket_id) = state.user_sockets.get(&msg.receiver_id) {
-                // Send to receiver's socket
-                if let Some(receiver_socket) = socket.get_socket(receiver_socket_id.value()) {
-                    let _ = receiver_socket.emit("chat message", msg.clone());
-                    debug!("✅ Message delivered to online user: {}", msg.receiver_id);
-                } else {
-                    // Socket not found, store in Redis
-                    store_pending_message(&state, &msg).await;
-                }
+                // Broadcast to receiver
+                let _ = socket.to(receiver_socket_id.value().to_string()).emit("chat message", msg.clone());
+                debug!("✅ Message delivered to online user: {}", msg.receiver_id);
             } else {
                 // User offline, store in Redis
                 store_pending_message(&state, &msg).await;
@@ -341,10 +336,10 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
             }
             
             // Send acknowledgment to sender
-            socket.emit("chat message", serde_json::json!({
+            let _ = socket.emit("chat message", serde_json::json!({
                 "status": "delivered",
                 "messageId": msg.message_id
-            }))
+            }));
         },
     );
     
@@ -354,16 +349,12 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
         |socket: SocketRef, Data::<MessageSeen>(seen), SocketState(state): SocketState<AppState>| async move {
             debug!("👁️ Message seen: {} by {}", seen.message_id, seen.user_id);
             
-            // Find sender's socket and notify
-            // Note: You need to track who sent which message to route this correctly
-            // For simplicity, we'll broadcast to the chat
-            if let Some(sender_socket_id) = state.user_sockets.get(&seen.user_id) {
-                if let Some(sender_socket) = socket.get_socket(sender_socket_id.value()) {
-                    let _ = sender_socket.emit("message_seen", seen);
+            // Broadcast to the other user in the chat
+            for entry in state.user_sockets.iter() {
+                if entry.key() != &seen.user_id {
+                    let _ = socket.to(entry.value().to_string()).emit("message_seen", seen.clone());
                 }
             }
-            
-            Ok(())
         },
     );
     
@@ -375,12 +366,8 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
             
             // Send to receiver
             if let Some(receiver_socket_id) = state.user_sockets.get(&typing.receiver_id) {
-                if let Some(receiver_socket) = socket.get_socket(receiver_socket_id.value()) {
-                    let _ = receiver_socket.emit("typing", typing);
-                }
+                let _ = socket.to(receiver_socket_id.value().to_string()).emit("typing", typing);
             }
-            
-            Ok(())
         },
     );
 }
@@ -539,13 +526,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_layer();
 
     // Register Socket.IO event handlers
+    io.ns("/", on_connect);
+    
     io.ns("/", |socket: SocketRef, SocketState(state): SocketState<AppState>| async move {
-        on_connect(socket.clone(), SocketState(state.clone())).await;
-    });
-
-    io.ns("/", |socket: SocketRef, SocketState(state): SocketState<AppState>| async move {
-        socket.on_disconnect(move || async move {
-            on_disconnect(socket, SocketState(state)).await;
+        let socket_id = socket.id.to_string();
+        
+        socket.on_disconnect(move |_socket: SocketRef| async move {
+            info!("🔴 Socket disconnected: {}", socket_id);
+            
+            // Remove from user_sockets mapping
+            state.user_sockets.retain(|_, v| v != &socket_id);
+            state.metrics.active_users.fetch_sub(1, Ordering::Relaxed);
+            
+            info!(
+                "📊 Remaining connections: {}",
+                state.metrics.active_users.load(Ordering::Relaxed)
+            );
         });
     });
 
