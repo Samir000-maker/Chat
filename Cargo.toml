@@ -9,9 +9,6 @@ axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
-# ✅ 2025 Best Practice: fred for Redis (better than redis-rs for async)
-fred = { version = "9", features = ["enable-rustls", "pool-prefer-active"] }
-
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
