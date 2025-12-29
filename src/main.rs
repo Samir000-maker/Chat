@@ -5,7 +5,7 @@ use axum::{
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use dashmap::DashMap;
@@ -14,7 +14,7 @@ use futures::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client as RedisClient, RedisError};
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, NONCE_LEN};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -26,14 +26,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{broadcast, Semaphore},
+    sync::Semaphore,
     time::interval,
 };
 use tower::ServiceBuilder;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use base64::{Engine as _, engine::general_purpose};
 
 // ==================== CONSTANTS & CONFIGURATION ====================
@@ -45,10 +45,8 @@ const USER_RATE_LIMIT: u64 = 100;
 const RATE_WINDOW_SECS: u64 = 60;
 const PENDING_MESSAGE_TTL: i64 = 300;
 const REDIS_POOL_SIZE: usize = 32;
-const MAX_MESSAGE_SIZE: usize = 65536;
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const CLIENT_TIMEOUT_SECS: u64 = 90;
-const MAX_PENDING_MESSAGES: usize = 1000;
 
 // AES-128-GCM Encryption
 const AES_KEY: &[u8] = b"0123456789abcdef";
@@ -97,8 +95,6 @@ struct UserConnection {
     user_id: String,
     tx: Sender<WsMessage>,
     last_activity: Arc<AtomicU64>,
-    message_count: Arc<AtomicU64>,
-    rate_limit_reset: Arc<AtomicU64>,
 }
 
 struct RateLimiter {
@@ -170,14 +166,6 @@ struct AppState {
     rate_limiter: Arc<RateLimiter>,
     metrics: Arc<Metrics>,
     connection_semaphore: Arc<Semaphore>,
-    broadcast_tx: broadcast::Sender<BroadcastMessage>,
-}
-
-#[derive(Debug, Clone)]
-enum BroadcastMessage {
-    Chat(ChatMessage),
-    Seen(MessageSeen),
-    Typing(TypingIndicator),
 }
 
 struct Metrics {
@@ -243,18 +231,21 @@ async fn create_redis_pool(redis_url: &str) -> Result<Vec<ConnectionManager>, Re
             }
             Err(e) => {
                 warn!("⚠️ Redis connection {} failed: {}", i, e);
+                if i == 0 {
+                    // If first connection fails, try fewer connections
+                    break;
+                }
             }
         }
     }
 
     if pool.is_empty() {
-        return Err(RedisError::from((
-            redis::ErrorKind::IoError,
-            "Failed to create any Redis connections",
-        )));
+        warn!("⚠️ No Redis connections available - running without persistence");
+        // Return empty pool instead of error - server can work without Redis
+    } else {
+        info!("📦 Redis pool created with {} connections", pool.len());
     }
 
-    info!("📦 Redis pool created with {} connections", pool.len());
     Ok(pool)
 }
 
@@ -286,7 +277,7 @@ async fn process_chat_message(state: &AppState, msg: ChatMessage) {
             debug!("✅ Message delivered to online user: {}", msg.receiver_id);
         }
     } else {
-        // User is offline - store in Redis and send push notification
+        // User is offline - store in Redis if available
         if let Some(mut redis) = get_redis_conn(state) {
             let key = format!("pending:{}", msg.receiver_id);
             let value = serde_json::to_string(&msg).unwrap_or_default();
@@ -294,31 +285,18 @@ async fn process_chat_message(state: &AppState, msg: ChatMessage) {
             let _: Result<(), RedisError> = redis.rpush(&key, &value).await;
             let _: Result<(), RedisError> = redis.expire(&key, PENDING_MESSAGE_TTL).await;
 
-            debug!(
-                "📦 Message buffered for offline user: {}",
-                msg.receiver_id
-            );
-
-            // Send push notification
-            tokio::spawn({
-                let state = state.clone();
-                let msg = msg.clone();
-                async move {
-                    send_push_notification(&state, &msg).await;
-                }
-            });
+            debug!("📦 Message buffered for offline user: {}", msg.receiver_id);
         }
-    }
 
-    // Update recent chats asynchronously
-    tokio::spawn({
-        let msg = msg.clone();
-        async move {
-            if let Err(e) = update_recent_chats(&msg).await {
-                warn!("Failed to update recent chats: {}", e);
+        // Send push notification
+        tokio::spawn({
+            let state = state.clone();
+            let msg = msg.clone();
+            async move {
+                send_push_notification(&state, &msg).await;
             }
-        }
-    });
+        });
+    }
 }
 
 async fn send_push_notification(state: &AppState, msg: &ChatMessage) {
@@ -341,11 +319,6 @@ async fn send_push_notification(state: &AppState, msg: &ChatMessage) {
     }
 }
 
-async fn update_recent_chats(msg: &ChatMessage) -> Result<(), Box<dyn std::error::Error>> {
-    debug!("Would update recent chats for chat_id: {}", msg.chat_id);
-    Ok(())
-}
-
 // ==================== WEBSOCKET HANDLER ====================
 
 async fn handle_websocket(ws: WebSocket, state: AppState, user_id: String) {
@@ -358,21 +331,11 @@ async fn handle_websocket(ws: WebSocket, state: AppState, user_id: String) {
             .unwrap()
             .as_secs(),
     ));
-    let message_count = Arc::new(AtomicU64::new(0));
-    let rate_limit_reset = Arc::new(AtomicU64::new(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + RATE_WINDOW_SECS,
-    ));
 
     let user_conn = UserConnection {
         user_id: user_id.clone(),
         tx: tx.clone(),
         last_activity: last_activity.clone(),
-        message_count: message_count.clone(),
-        rate_limit_reset: rate_limit_reset.clone(),
     };
 
     state.connections.insert(user_id.clone(), user_conn);
@@ -388,7 +351,7 @@ async fn handle_websocket(ws: WebSocket, state: AppState, user_id: String) {
         state.metrics.active_users.load(Ordering::Relaxed)
     );
 
-    // Replay pending messages
+    // Replay pending messages if Redis is available
     tokio::spawn({
         let state = state.clone();
         let user_id = user_id.clone();
@@ -614,10 +577,15 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, metrics)
 }
 
+async fn root_handler() -> &'static str {
+    "Ultra Chat Server - Running 🚀"
+}
+
 // ==================== MAIN APPLICATION ====================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
@@ -626,16 +594,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("🚀 Ultra Chat Server Starting...");
 
+    // Get configuration from environment
     let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
-        .parse::<u16>()?;
+        .parse::<u16>()
+        .unwrap_or(3000);
 
-    let redis_pool = create_redis_pool(&redis_url).await?;
+    info!("📡 Configured port: {}", port);
+
+    // Create Redis pool (non-blocking)
+    let redis_pool = match create_redis_pool(&redis_url).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            warn!("⚠️ Redis connection failed: {} - continuing without Redis", e);
+            Vec::new()
+        }
+    };
 
     let max_connections = MAX_CONNECTIONS_PER_WORKER * WORKER_COUNT;
-    let (broadcast_tx, _) = broadcast::channel(100_000);
 
     let state = AppState {
         connections: Arc::new(DashMap::with_capacity(max_connections)),
@@ -644,10 +622,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter: Arc::new(RateLimiter::new()),
         metrics: Arc::new(Metrics::new()),
         connection_semaphore: Arc::new(Semaphore::new(max_connections)),
-        broadcast_tx,
     };
 
+    // Build router
     let app = Router::new()
+        .route("/", get(root_handler))
         .route("/ws/:user_id", get(ws_handler))
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_handler))
@@ -660,6 +639,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_state(state.clone());
 
+    // Stats reporting task
     tokio::spawn({
         let state = state.clone();
         async move {
@@ -676,12 +656,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("🎯 Server listening on {}", addr);
-    info!("📡 Max connections: {}", max_connections);
-    info!("⚡ Ready to handle BILLIONS of messages!");
+    // Bind to address - support both IPv4 and IPv6
+    let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
+    
+    info!("🎯 Attempting to bind to address: {}", addr);
+    
+    // Create TCP listener
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            let local_addr = listener.local_addr()?;
+            info!("✅ Successfully bound to: {}", local_addr);
+            info!("🌐 Server is now accessible on port {}", port);
+            listener
+        }
+        Err(e) => {
+            error!("❌ Failed to bind to {}: {}", addr, e);
+            error!("💡 Trying fallback IPv4-only binding...");
+            
+            // Fallback to IPv4 only
+            let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+            let listener = tokio::net::TcpListener::bind(addr_v4).await?;
+            let local_addr = listener.local_addr()?;
+            info!("✅ Successfully bound to IPv4: {}", local_addr);
+            listener
+        }
+    };
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("📡 Max connections: {}", max_connections);
+    info!("⚡ Ready to handle messages!");
+    info!("🔗 WebSocket endpoint: ws://0.0.0.0:{}/ws/:user_id", port);
+    info!("💚 Health check: http://0.0.0.0:{}/health", port);
+
+    // Start server
     axum::serve(listener, app).await?;
 
     Ok(())
