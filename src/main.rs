@@ -10,11 +10,7 @@ use axum::{
     Router,
 };
 use dashmap::DashMap;
-use fred::{
-    clients::RedisPool,
-    interfaces::ClientLike,
-    types::{ReconnectPolicy, RedisConfig},
-};
+
 use futures_util::{
     sink::SinkExt,
     stream::{SplitSink, SplitStream, StreamExt},
