@@ -169,20 +169,15 @@ impl AppState {
         Ok(())
     }
 
-    fn remove_connection(&self, user_id: &str, tx: &broadcast::Sender<ServerMessage>) {
-        if let Some(mut entry) = self.connections.get_mut(user_id) {
-            entry.retain(|conn| !Arc::ptr_eq(&conn.tx, tx));
-            let remaining = entry.len();
-            
-            if remaining == 0 {
-                drop(entry);
-                self.connections.remove(user_id);
-                info!("👋 User {} fully disconnected", user_id);
-            } else {
-                info!("🔌 User {} connection closed ({} remaining)", user_id, remaining);
-            }
+fn remove_connection(connections: &DashMap<String, Vec<UserConnection>>, user_id: &str, tx: &Sender<WsMessage>) {
+    if let Some(mut entry) = connections.get_mut(user_id) {
+        entry.retain(|conn| !std::ptr::eq(&conn.tx as *const _, tx as *const _));
+        if entry.is_empty() {
+            drop(entry);
+            connections.remove(user_id);
         }
     }
+}
 
     async fn send_to_user(&self, user_id: &str, message: ServerMessage) {
         if let Some(connections) = self.connections.get(user_id) {
