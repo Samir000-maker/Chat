@@ -8,6 +8,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+
+
 #[derive(Clone)]
 pub struct FcmService {
     project_id: String,
@@ -40,6 +42,16 @@ struct TokenResponse {
     token_type: String,
 }
 
+#[allow(dead_code)]
+token_uri: String,
+
+
+// Add #[allow(dead_code)] above the fields:
+#[allow(dead_code)]
+expires_in: u64,
+#[allow(dead_code)]
+token_type: String,
+    
 impl FcmService {
     /// Initialize Firebase Cloud Messaging service
     pub fn new(service_account_path: &str) -> Result<Self> {
