@@ -217,7 +217,9 @@ async fn main() -> anyhow::Result<()> {
         message_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
-// ==================== SOCKET.IO SETUP (REPLACE ENTIRE SECTION) ====================
+// ==================== SOCKET.IO SETUP ====================
+
+let app_state_for_io = state.clone();
 
 let (socket_layer, io) = SocketIo::builder()
     .with_state(state.clone())
@@ -229,9 +231,8 @@ let (socket_layer, io) = SocketIo::builder()
 io.ns("/", move |socket: SocketRef| {
     info!("[Worker {}] Client connected: {}", std::process::id(), socket.id);
 
-    // ✅ Get state once at connection time
-    let state = socket.extensions.get::<AppState>().cloned()
-        .expect("AppState not found in socket extensions");
+    // ✅ Use the captured state from the outer scope
+    let state = app_state_for_io.clone();
 
     // Clone state for each handler
     let state_register = state.clone();
