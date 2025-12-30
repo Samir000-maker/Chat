@@ -216,87 +216,84 @@ async fn main() -> anyhow::Result<()> {
         message_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    let (socket_layer, io) = SocketIo::builder()
-        .with_state(state.clone())
-        .max_buffer_size(1024 * 1024)
-        .ping_interval(Duration::from_secs(25))
-        .ping_timeout(Duration::from_secs(60))
-        .build_layer();
+let (socket_layer, io) = SocketIo::builder()
+    .with_state(state.clone())
+    .max_buffer_size(1024 * 1024)
+    .ping_interval(Duration::from_secs(25))
+    .ping_timeout(Duration::from_secs(60))
+    .build_layer();
 
-    // ✅ CRITICAL FIX: Register ALL event handlers INSIDE the connection handler
-    io.ns("/", |socket: SocketRef, state: SocketState<AppState>| {
-        info!("[Worker {}] Client connected: {}", std::process::id(), socket.id);
+    io.ns("/", |socket: SocketRef| {
+    info!("[Worker {}] Client connected: {}", std::process::id(), socket.id);
 
-        // Clone state for each handler
-        let state_register = state.clone();
-        let state_message = state.clone();
-        let state_seen = state.clone();
+    // ✅ CRITICAL FIX: Use socket.state() to access state inside handlers
+    
+    // Handler 1: register
+    socket.on(
+        "register",
+        |socket: SocketRef, Data::<String>(user_id): Data<String>| async move {
+            if user_id.is_empty() {
+                let _ = socket.emit("error", &json!({"message": "Invalid userId"}));
+                return;
+            }
 
-        // ✅ Register "register" event handler
-        socket.on(
-            "register",
-            move |socket: SocketRef, Data::<String>(user_id): Data<String>| {
-                let state = state_register.clone();
-                async move {
-                    if user_id.is_empty() {
-                        let _ = socket.emit("error", &json!({"message": "Invalid userId"}));
-                        return;
-                    }
+            let _ = socket.leave_all();
+            let _ = socket.join(user_id.clone());
+            
+            info!("[Worker {}] User registered: {}", std::process::id(), user_id);
 
-                    let _ = socket.leave_all();
-                    let _ = socket.join(user_id.clone());
-                    
-                    info!("[Worker {}] User registered: {}", std::process::id(), user_id);
+            // Get state from socket
+            let state = socket.get_state::<AppState>().unwrap();
 
-                    if let Err(e) = replay_pending_messages(&socket, &user_id, &state).await {
-                        error!("Failed to replay pending messages for {}: {}", user_id, e);
-                    }
+            if let Err(e) = replay_pending_messages(&socket, &user_id, &state).await {
+                error!("Failed to replay pending messages for {}: {}", user_id, e);
+            }
 
-                    if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state).await {
-                        error!("Failed to replay pending seen events for {}: {}", user_id, e);
-                    }
-                }
-            },
-        );
+            if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state).await {
+                error!("Failed to replay pending seen events for {}: {}", user_id, e);
+            }
+        },
+    );
 
-        // ✅ Register "chat message" event handler
-        socket.on(
-            "chat message",
-            move |socket: SocketRef, Data::<ChatMessage>(message): Data<ChatMessage>, ack: AckSender| {
-                let state = state_message.clone();
-                async move {
-                    info!("[Worker {}] 📨 Received message: {}", std::process::id(), message.message_id);
-                    handle_chat_message(socket, message, ack, state).await;
-                }
-            },
-        );
+    // Handler 2: chat message
+    socket.on(
+        "chat message",
+        |socket: SocketRef, Data::<ChatMessage>(message): Data<ChatMessage>, ack: AckSender| async move {
+            info!("[Worker {}] 📨 Received message: {}", std::process::id(), message.message_id);
+            
+            // Get state from socket
+            let state = socket.get_state::<AppState>().unwrap();
+            
+            handle_chat_message(socket, message, ack, state).await;
+        },
+    );
 
-        // ✅ Register "message_seen" event handler
-        socket.on(
-            "message_seen",
-            move |socket: SocketRef, Data::<MessageSeenEvent>(data): Data<MessageSeenEvent>| {
-                let state = state_seen.clone();
-                async move {
-                    handle_message_seen(socket, data, state).await;
-                }
-            },
-        );
+    // Handler 3: message_seen
+    socket.on(
+        "message_seen",
+        |socket: SocketRef, Data::<MessageSeenEvent>(data): Data<MessageSeenEvent>| async move {
+            // Get state from socket
+            let state = socket.get_state::<AppState>().unwrap();
+            
+            handle_message_seen(socket, data, state).await;
+        },
+    );
 
-        // ✅ Register "typing" event handler
-        socket.on(
-            "typing",
-            |socket: SocketRef, Data::<TypingEvent>(data): Data<TypingEvent>| async move {
-                if !data.receiver_id.is_empty() {
-                    let _ = socket.to(data.receiver_id.clone()).emit("typing", &data);
-                }
-            },
-        );
+    // Handler 4: typing
+    socket.on(
+        "typing",
+        |socket: SocketRef, Data::<TypingEvent>(data): Data<TypingEvent>| async move {
+            if !data.receiver_id.is_empty() {
+                let _ = socket.to(data.receiver_id.clone()).emit("typing", &data);
+            }
+        },
+    );
 
-        // ✅ Register disconnect handler
-        socket.on_disconnect(|socket: SocketRef| async move {
-            info!("[Worker {}] Client disconnected: {}", std::process::id(), socket.id);
-        });
+    // Handler 5: disconnect
+    socket.on_disconnect(|socket: SocketRef| async move {
+        info!("[Worker {}] Client disconnected: {}", std::process::id(), socket.id);
     });
+});
 
     let app = Router::new()
         .route("/health", get(health_check))
