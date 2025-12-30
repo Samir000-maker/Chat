@@ -14,7 +14,7 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Socket.IO compatible server
-socketioxide = { version = "0.15", features = ["v4"] }
+socketioxide = { version = "0.15", features = ["state", "v4", "v5"] }
 
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
