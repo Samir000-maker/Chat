@@ -15,7 +15,6 @@ use socketioxide::{
 };
 use std::{
     collections::HashMap,
-    process,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -34,7 +33,6 @@ use rate_limit::RateLimiter;
 
 // ==================== CONFIGURATION ====================
 
-const AES_KEY: &str = "0123456789abcdef";
 const RATE_LIMIT: u32 = 100;
 const RATE_WINDOW_MS: u64 = 60000;
 const MESSAGE_CACHE_TTL: u64 = 300;
@@ -135,7 +133,6 @@ struct AppState {
     fcm_service: Option<Arc<FcmService>>,
     rate_limiter: Arc<RwLock<RateLimiter>>,
     mongodb_api_url: String,
-    // In-memory fallback storage
     pending_messages: Arc<RwLock<HashMap<String, Vec<ChatMessage>>>>,
     pending_seen_events: Arc<RwLock<HashMap<String, Vec<MessageSeenEvent>>>>,
     message_cache: Arc<RwLock<HashMap<String, ChatMessage>>>,
@@ -145,7 +142,6 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -153,7 +149,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Load environment variables
     dotenv::dotenv().ok();
 
     let port = std::env::var("PORT")
@@ -172,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
     info!("🚀 Starting Chat Server on port {}", port);
     info!("📱 Looking for FCM service account at: {}", fcm_service_account_path);
 
-    // Initialize Redis (optional)
+    // Initialize Redis
     info!("📡 Connecting to Redis at {}", redis_url);
     let redis_conn = match redis::Client::open(redis_url.clone()) {
         Ok(client) => match ConnectionManager::new(client).await {
@@ -182,21 +177,19 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 warn!("⚠️ Failed to connect to Redis: {}", e);
-                warn!("💡 Using in-memory storage (messages will not persist across restarts)");
+                warn!("💡 Using in-memory storage");
                 None
             }
         },
         Err(e) => {
             warn!("⚠️ Invalid Redis URL: {}", e);
-            warn!("💡 Using in-memory storage (messages will not persist across restarts)");
+            warn!("💡 Using in-memory storage");
             None
         }
     };
 
-    // Initialize FCM (optional)
+    // Initialize FCM
     info!("📱 Initializing Firebase Cloud Messaging");
-    info!("🔍 Looking for FCM service account at: {}", fcm_service_account_path);
-    
     let fcm_service = match FcmService::new(&fcm_service_account_path) {
         Ok(service) => {
             info!("✅ Firebase Admin initialized - Project: {}", service.project_id());
@@ -205,14 +198,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             warn!("⚠️ Failed to initialize FCM: {}", e);
-            warn!("⚠️ FCM service account path tried: {}", fcm_service_account_path);
             warn!("💡 Push notifications will be disabled");
-            warn!("💡 To enable FCM, ensure fcm-service-account.json exists at: {}", fcm_service_account_path);
             None
         }
     };
 
-    // Initialize shared state
     let state = AppState {
         redis: redis_conn,
         fcm_tokens: Arc::new(RwLock::new(HashMap::new())),
@@ -227,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
         message_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    // Create Socket.IO layer with protocol configuration
+    // Create Socket.IO layer
     let (socket_layer, io) = SocketIo::builder()
         .with_state(state.clone())
         .max_buffer_size(1024 * 1024)
@@ -235,71 +225,76 @@ async fn main() -> anyhow::Result<()> {
         .ping_timeout(Duration::from_secs(60))
         .build_layer();
 
-    // Configure Socket.IO event handlers
-    io.ns("/", |socket: SocketRef, _state: SocketState<AppState>| {
-        info!("🔌 Client connected: {}", socket.id);
-        info!("📋 Registering Socket.IO event handlers for socket: {}", socket.id);
+    // Configure Socket.IO namespace
+    io.ns("/", move |socket: SocketRef, state: SocketState<AppState>| {
+        info!("[Worker {}] Client connected: {}", std::process::id(), socket.id);
 
         // Register event
+        let state_clone = state.clone();
         socket.on(
             "register",
-            |socket: SocketRef, Data::<String>(user_id), state: SocketState<AppState>| async move {
-                if user_id.is_empty() {
-                    let _: Result<(), _> = socket.emit("error", &json!({"message": "Invalid userId"}));
-                    return;
-                }
+            move |socket: SocketRef, Data::<String>(user_id): Data<String>| {
+                let state = state_clone.clone();
+                async move {
+                    if user_id.is_empty() {
+                        let _ = socket.emit("error", json!({"message": "Invalid userId"}));
+                        return;
+                    }
 
-                let _: Result<(), _> = socket.leave_all();
-                let _: Result<(), _> = socket.join(user_id.clone());
-                
-                info!("✅ User registered: {} (socket: {})", user_id, socket.id);
+                    let _ = socket.leave_all();
+                    let _ = socket.join(user_id.clone());
+                    
+                    info!("[Worker {}] User registered: {}", std::process::id(), user_id);
 
-                // Replay pending messages
-                if let Err(e) = replay_pending_messages(&socket, &user_id, &state).await {
-                    error!("Failed to replay pending messages for {}: {}", user_id, e);
-                }
+                    if let Err(e) = replay_pending_messages(&socket, &user_id, &state).await {
+                        error!("Failed to replay pending messages for {}: {}", user_id, e);
+                    }
 
-                // Replay pending seen events
-                if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state).await {
-                    error!("Failed to replay pending seen events for {}: {}", user_id, e);
+                    if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state).await {
+                        error!("Failed to replay pending seen events for {}: {}", user_id, e);
+                    }
                 }
             },
         );
 
-        // Chat message event - CRITICAL: State extractor must come BEFORE Data extractor
+        // Chat message event - CRITICAL: Data extractor AFTER other extractors
+        let state_clone = state.clone();
         socket.on(
             "chat message",
-            |socket: SocketRef, state: SocketState<AppState>, Data::<ChatMessage>(message), ack: AckSender| async move {
-                info!("[Worker {}] 🔔 CHAT MESSAGE EVENT TRIGGERED!", process::id());
-                info!("[Worker {}] 📨 Received message: {}", process::id(), message.message_id);
-                handle_chat_message(socket, message, ack, state).await;
+            move |socket: SocketRef, Data::<ChatMessage>(message): Data<ChatMessage>, ack: AckSender| {
+                let state = state_clone.clone();
+                async move {
+                    info!("[Worker {}] 📨 Received message: {}", std::process::id(), message.message_id);
+                    handle_chat_message(socket, message, ack, state).await;
+                }
             },
         );
 
         // Message seen event
+        let state_clone = state.clone();
         socket.on(
             "message_seen",
-            |socket: SocketRef, Data::<MessageSeenEvent>(data), state: SocketState<AppState>| async move {
-                handle_message_seen(socket, data, state).await;
+            move |socket: SocketRef, Data::<MessageSeenEvent>(data): Data<MessageSeenEvent>| {
+                let state = state_clone.clone();
+                async move {
+                    handle_message_seen(socket, data, state).await;
+                }
             },
         );
 
         // Typing event
         socket.on(
             "typing",
-            |socket: SocketRef, Data::<TypingEvent>(data)| async move {
+            |socket: SocketRef, Data::<TypingEvent>(data): Data<TypingEvent>| async move {
                 if !data.receiver_id.is_empty() {
-                    let receiver_id = data.receiver_id.clone();
-                    let _: Result<(), _> = socket.to(receiver_id).emit("typing", &data);
+                    let _ = socket.to(data.receiver_id.clone()).emit("typing", &data);
                 }
             },
         );
 
         socket.on_disconnect(|socket: SocketRef| async move {
-            info!("🔌 Client disconnected: {}", socket.id);
+            info!("[Worker {}] Client disconnected: {}", std::process::id(), socket.id);
         });
-        
-        info!("✅ All event handlers registered successfully for socket: {}", socket.id);
     });
 
     // Build HTTP router
@@ -316,7 +311,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(state);
 
-    // Start server
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("🎉 Server listening on {}", addr);
@@ -333,9 +327,9 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     
     Json(HealthResponse {
         status: "ok".to_string(),
-        fcm_enabled: true,
+        fcm_enabled: state.fcm_service.is_some(),
         registered_tokens: token_count,
-        firebase_initialized: true,
+        firebase_initialized: state.fcm_service.is_some(),
     })
 }
 
@@ -381,11 +375,14 @@ async fn register_fcm_token(
         .await
         .insert(req.user_id.clone(), token_data);
 
+    let token_count = state.fcm_tokens.read().await.len();
+
     info!(
-        "✅ FCM token registered for user: {} (token: {}...)",
-        req.user_id,
-        &req.token[..20.min(req.token.len())]
+        "✅ FCM token registered for user: {}",
+        req.user_id
     );
+    info!("   Token: {}...", &req.token[..20.min(req.token.len())]);
+    info!("   Total registered tokens: {}", token_count);
 
     (
         StatusCode::OK,
@@ -436,7 +433,7 @@ async fn get_recent_chats(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> impl IntoResponse {
-    info!("📥 Proxying recent chats request for {}", user_id);
+    info!("[Worker {}] 📥 Proxying recent chats request for {}", std::process::id(), user_id);
 
     let url = format!("{}/recent-chats/{}", state.mongodb_api_url, user_id);
     
@@ -470,11 +467,11 @@ async fn handle_chat_message(
     socket: SocketRef,
     message: ChatMessage,
     ack: AckSender,
-    state: SocketState<AppState>,
+    state: AppState,
 ) {
-    info!("[Worker {}] 🎯 handle_chat_message FUNCTION CALLED", process::id());
-    info!("[Worker {}] 📦 Message data: sender={}, receiver={}, messageId={}", 
-        process::id(), message.sender_id, message.receiver_id, message.message_id);
+    let worker_id = std::process::id();
+    info!("[Worker {}] Message {}: {} -> {}", 
+        worker_id, message.message_id, message.sender_id, message.receiver_id);
     
     // Validation
     if message.sender_id.is_empty()
@@ -482,7 +479,7 @@ async fn handle_chat_message(
         || message.chat_id.is_empty()
         || message.message_id.is_empty()
     {
-        error!("[Worker {}] ❌ Invalid message structure - missing required fields", process::id());
+        error!("[Worker {}] ❌ Invalid message structure", worker_id);
         let error_response = ErrorResponse {
             status: "error".to_string(),
             message: "Invalid message structure".to_string(),
@@ -491,14 +488,11 @@ async fn handle_chat_message(
         return;
     }
 
-    info!("[Worker {}] ✅ Message validated successfully", process::id());
-
     // Rate limiting
     {
-        info!("[Worker {}] 🚦 Checking rate limit for user: {}", process::id(), message.sender_id);
         let mut limiter = state.rate_limiter.write().await;
         if !limiter.check(&message.sender_id) {
-            warn!("[Worker {}] ⚠️ Rate limit exceeded for {}", process::id(), message.sender_id);
+            warn!("[Worker {}] ⚠️ Rate limit exceeded for {}", worker_id, message.sender_id);
             let error_response = ErrorResponse {
                 status: "error".to_string(),
                 message: "Rate limit exceeded".to_string(),
@@ -508,17 +502,8 @@ async fn handle_chat_message(
         }
     }
 
-    info!("[Worker {}] ✅ Rate limit check passed", process::id());
-
-    info!(
-        "💬 Message {}: {} -> {}",
-        message.message_id, message.sender_id, message.receiver_id
-    );
-
-    // Store message in Redis or in-memory cache
-    info!("💾 Storing message in cache...");
+    // Store message in cache
     if let Some(redis) = &state.redis {
-        info!("📍 Using Redis for message storage");
         let msg_key = format!("msg:{}", message.message_id);
         let msg_json = serde_json::to_string(&message).unwrap();
         let mut redis_conn = redis.clone();
@@ -531,17 +516,13 @@ async fn handle_chat_message(
 
         if let Err(e) = set_result {
             error!("❌ Failed to store message in Redis: {}", e);
-        } else {
-            info!("✅ Message stored in Redis");
         }
     } else {
-        info!("📍 Using in-memory cache for message storage");
         state
             .message_cache
             .write()
             .await
             .insert(message.message_id.clone(), message.clone());
-        info!("✅ Message stored in memory");
     }
 
     // Update recent chats in MongoDB (fire and forget)
@@ -557,52 +538,34 @@ async fn handle_chat_message(
     let receiver_sockets = socket.within(message.receiver_id.clone()).sockets().unwrap_or_default();
     let is_receiver_online = !receiver_sockets.is_empty();
 
-    info!(
-        "[Worker {}] 📡 Receiver {} is {}",
-        process::id(),
-        message.receiver_id,
-        if is_receiver_online { "ONLINE" } else { "OFFLINE" }
-    );
-
     if is_receiver_online {
         // Deliver to online user
-        let _: Result<(), _> = socket
+        let _ = socket
             .within(message.receiver_id.clone())
             .emit("chat message", &message);
         info!(
             "[Worker {}] ✅ Message delivered to ONLINE user {}",
-            process::id(),
-            message.receiver_id
+            worker_id, message.receiver_id
         );
     } else {
         // Buffer for offline user
         if let Some(redis) = &state.redis {
-            // Use Redis
             let pending_key = format!("pending:{}", message.receiver_id);
             let msg_json = serde_json::to_string(&message).unwrap();
             let mut redis_conn = redis.clone();
             
-            let rpush_result: Result<(), redis::RedisError> = redis::cmd("RPUSH")
+            let _: Result<(), redis::RedisError> = redis::cmd("RPUSH")
                 .arg(&pending_key)
                 .arg(&msg_json)
                 .query_async(&mut redis_conn)
                 .await;
 
-            if let Err(e) = rpush_result {
-                error!("Failed to buffer message: {}", e);
-            }
-
-            let expire_result: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
+            let _: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
                 .arg(&pending_key)
                 .arg(MESSAGE_CACHE_TTL)
                 .query_async(&mut redis_conn)
                 .await;
-
-            if let Err(e) = expire_result {
-                error!("Failed to set expiry on pending messages: {}", e);
-            }
         } else {
-            // Use in-memory storage
             state
                 .pending_messages
                 .write()
@@ -612,10 +575,10 @@ async fn handle_chat_message(
                 .push(message.clone());
         }
 
-        info!("[Worker {}] 📦 Buffered message for OFFLINE user {}", process::id(), message.receiver_id);
+        info!("[Worker {}] 📦 Buffered message for OFFLINE user {}", worker_id, message.receiver_id);
 
         // Send push notification
-        info!("[Worker {}] 📲 Sending push notification to {}...", process::id(), message.receiver_id);
+        info!("[Worker {}] 📲 Sending push notification to {}...", worker_id, message.receiver_id);
         
         let tokens = state.fcm_tokens.read().await;
         if let Some(token_data) = tokens.get(&message.receiver_id) {
@@ -642,10 +605,12 @@ async fn handle_chat_message(
                     .await
                     {
                         Ok(message_id) => {
-                            info!("✅ Push notification sent - FCM ID: {}", message_id);
+                            info!("✅ [Worker {}] Push notification sent to {}", std::process::id(), receiver_id);
+                            info!("   From: {}", sender_name);
+                            info!("   FCM Message ID: {}", message_id);
                         }
                         Err(e) => {
-                            warn!("⚠️ Push notification failed: {}", e);
+                            warn!("⚠️ [Worker {}] Push notification failed: {}", std::process::id(), e);
                         }
                     }
                 });
@@ -653,11 +618,11 @@ async fn handle_chat_message(
                 warn!("⚠️ FCM service not available");
             }
         } else {
-            warn!("⚠️ No FCM token found for user: {}", message.receiver_id);
+            warn!("⚠️ [Worker {}] No FCM token found for user: {}", worker_id, message.receiver_id);
         }
     }
 
-    // Send acknowledgment via AckSender
+    // Send acknowledgment
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -670,31 +635,25 @@ async fn handle_chat_message(
     };
 
     if let Err(e) = ack.send(&ack_response) {
-        error!("[Worker {}] ❌ Failed to send acknowledgment: {}", process::id(), e);
-    } else {
-        info!(
-            "[Worker {}] ✅ Acknowledgment sent successfully for message: {}",
-            process::id(),
-            message.message_id
-        );
+        error!("[Worker {}] ❌ Failed to send acknowledgment: {}", worker_id, e);
     }
 }
 
 async fn handle_message_seen(
     socket: SocketRef,
     data: MessageSeenEvent,
-    state: SocketState<AppState>,
+    state: AppState,
 ) {
+    let worker_id = std::process::id();
+    
     if data.user_id.is_empty() || data.message_id.is_empty() {
         error!("Invalid seen event data");
         return;
     }
 
-    info!("👁️ Message seen: {} by {}", data.message_id, data.user_id);
+    info!("[Worker {}] Message seen: {} by {}", worker_id, data.message_id, data.user_id);
 
-    // Get original message to find sender
     let sender_id = if let Some(redis) = &state.redis {
-        // Use Redis
         let msg_key = format!("msg:{}", data.message_id);
         let mut redis_conn = redis.clone();
         let msg_str: Result<Option<String>, redis::RedisError> = redis::cmd("GET")
@@ -720,7 +679,6 @@ async fn handle_message_seen(
             }
         }
     } else {
-        // Use in-memory cache
         let cache = state.message_cache.read().await;
         match cache.get(&data.message_id) {
             Some(msg) => msg.sender_id.clone(),
@@ -743,41 +701,29 @@ async fn handle_message_seen(
         timestamp: now,
     };
 
-    // Check if sender is online
     let sender_sockets = socket.within(sender_id.clone()).sockets().unwrap_or_default();
     let is_sender_online = !sender_sockets.is_empty();
 
     if is_sender_online {
-        let _: Result<(), _> = socket.within(sender_id.clone()).emit("message_seen", &evt);
+        let _ = socket.within(sender_id.clone()).emit("message_seen", &evt);
     } else {
-        // Buffer for offline sender
         if let Some(redis) = &state.redis {
-            // Use Redis
             let pending_key = format!("pending_seen:{}", sender_id);
             let evt_json = serde_json::to_string(&evt).unwrap();
             let mut redis_conn = redis.clone();
 
-            let rpush_result: Result<(), redis::RedisError> = redis::cmd("RPUSH")
+            let _: Result<(), redis::RedisError> = redis::cmd("RPUSH")
                 .arg(&pending_key)
                 .arg(&evt_json)
                 .query_async(&mut redis_conn)
                 .await;
 
-            if let Err(e) = rpush_result {
-                error!("Failed to buffer seen event: {}", e);
-            }
-
-            let expire_result: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
+            let _: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
                 .arg(&pending_key)
                 .arg(MESSAGE_CACHE_TTL)
                 .query_async(&mut redis_conn)
                 .await;
-
-            if let Err(e) = expire_result {
-                error!("Failed to set expiry on pending seen events: {}", e);
-            }
         } else {
-            // Use in-memory storage
             state
                 .pending_seen_events
                 .write()
@@ -796,8 +742,8 @@ async fn replay_pending_messages(
     user_id: &str,
     state: &AppState,
 ) -> anyhow::Result<()> {
+    let worker_id = std::process::id();
     let messages = if let Some(redis) = &state.redis {
-        // Use Redis
         let pending_key = format!("pending:{}", user_id);
         let mut redis_conn = redis.clone();
         let messages: Vec<String> = redis::cmd("LRANGE")
@@ -819,17 +765,16 @@ async fn replay_pending_messages(
             .filter_map(|s| serde_json::from_str::<ChatMessage>(s).ok())
             .collect()
     } else {
-        // Use in-memory storage
         let mut pending = state.pending_messages.write().await;
         pending.remove(user_id).unwrap_or_default()
     };
 
     for msg in &messages {
-        let _: Result<(), _> = socket.emit("chat message", msg);
+        let _ = socket.emit("chat message", msg);
     }
 
     if !messages.is_empty() {
-        info!("📬 Replayed {} pending messages for {}", messages.len(), user_id);
+        info!("[Worker {}] Replayed {} pending messages for {}", worker_id, messages.len(), user_id);
     }
 
     Ok(())
@@ -840,8 +785,8 @@ async fn replay_pending_seen_events(
     user_id: &str,
     state: &AppState,
 ) -> anyhow::Result<()> {
+    let worker_id = std::process::id();
     let events = if let Some(redis) = &state.redis {
-        // Use Redis
         let pending_key = format!("pending_seen:{}", user_id);
         let mut redis_conn = redis.clone();
         let events: Vec<String> = redis::cmd("LRANGE")
@@ -863,17 +808,16 @@ async fn replay_pending_seen_events(
             .filter_map(|s| serde_json::from_str::<MessageSeenEvent>(s).ok())
             .collect()
     } else {
-        // Use in-memory storage
         let mut pending = state.pending_seen_events.write().await;
         pending.remove(user_id).unwrap_or_default()
     };
 
     for evt in &events {
-        let _: Result<(), _> = socket.emit("message_seen", evt);
+        let _ = socket.emit("message_seen", evt);
     }
 
     if !events.is_empty() {
-        info!("👁️ Replayed {} pending seen events for {}", events.len(), user_id);
+        info!("[Worker {}] Replayed {} pending seen events for {}", worker_id, events.len(), user_id);
     }
 
     Ok(())
@@ -883,6 +827,7 @@ async fn update_recent_chats_in_mongodb(
     mongodb_url: &str,
     message: &ChatMessage,
 ) -> anyhow::Result<()> {
+    let worker_id = std::process::id();
     let url = format!("{}/recent-chats/update", mongodb_url);
     
     let payload = json!({
@@ -904,7 +849,7 @@ async fn update_recent_chats_in_mongodb(
         .await?;
 
     if response.status().is_success() {
-        info!("✅ Recent chats updated in MongoDB for chat {}", message.chat_id);
+        info!("[Worker {}] ✅ Recent chats updated in MongoDB for chat {}", worker_id, message.chat_id);
     } else {
         warn!("⚠️ Failed to update recent chats: status {}", response.status());
     }
@@ -921,8 +866,9 @@ async fn send_push_notification(
     sender_id: &str,
     token: &str,
 ) -> anyhow::Result<String> {
-    info!("Original message text length: {}", message_text.len());
-    info!("First 30 chars: {}", &message_text[..30.min(message_text.len())]);
+    let worker_id = std::process::id();
+    info!("[Worker {}] Original message text length: {}", worker_id, message_text.len());
+    info!("[Worker {}] First 30 chars: {}", worker_id, &message_text[..30.min(message_text.len())]);
 
     let mut notification_text = message_text.to_string();
 
@@ -932,19 +878,19 @@ async fn send_push_notification(
         && !message_text.contains(' ');
 
     if is_encrypted {
-        info!("Message appears encrypted, attempting decryption...");
+        info!("[Worker {}] Message appears encrypted, attempting decryption...", worker_id);
         match decrypt_message(message_text) {
-            Ok(decrypted) if decrypted != "New message" => {
+            Ok(decrypted) if !decrypted.is_empty() && decrypted != "New message" => {
                 notification_text = decrypted;
-                info!("✅ Successfully decrypted: \"{}\"", notification_text);
+                info!("[Worker {}] ✅ Successfully decrypted: \"{}\"", worker_id, notification_text);
             }
             _ => {
-                info!("⚠️ Decryption failed, using fallback");
+                info!("[Worker {}] ⚠️ Decryption failed, using fallback", worker_id);
                 notification_text = "New message".to_string();
             }
         }
     } else {
-        info!("Message does not appear encrypted");
+        info!("[Worker {}] Message does not appear encrypted", worker_id);
     }
 
     // Truncate long messages
@@ -968,14 +914,6 @@ async fn send_push_notification(
             &now,
         )
         .await?;
-
-    info!("✅ Push notification sent to {}", receiver_user_id);
-    info!("   From: {}", sender_name);
-    info!(
-        "   Message preview: \"{}{}\"",
-        &notification_text[..50.min(notification_text.len())],
-        if notification_text.len() > 50 { "..." } else { "" }
-    );
 
     Ok(message_id)
 }
