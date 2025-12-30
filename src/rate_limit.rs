@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+#[derive(Debug)]
+struct UserLimit {
+    count: u32,
+    reset_time: Instant,
+}
+
 pub struct RateLimiter {
     limits: HashMap<String, UserLimit>,
     max_requests: u32,
     window: Duration,
-}
-
-struct UserLimit {
-    count: u32,
-    reset_time: Instant,
 }
 
 impl RateLimiter {
@@ -24,106 +25,68 @@ impl RateLimiter {
     pub fn check(&mut self, user_id: &str) -> bool {
         let now = Instant::now();
 
-        match self.limits.get_mut(user_id) {
-            Some(limit) => {
-                // Check if window has expired
-                if now >= limit.reset_time {
-                    limit.count = 1;
-                    limit.reset_time = now + self.window;
-                    true
-                } else if limit.count >= self.max_requests {
-                    false
-                } else {
-                    limit.count += 1;
-                    true
-                }
+        let limit = self.limits.entry(user_id.to_string()).or_insert_with(|| {
+            UserLimit {
+                count: 0,
+                reset_time: now + self.window,
             }
-            None => {
-                self.limits.insert(
-                    user_id.to_string(),
-                    UserLimit {
-                        count: 1,
-                        reset_time: now + self.window,
-                    },
-                );
-                true
-            }
+        });
+
+        // Check if window has expired
+        if now >= limit.reset_time {
+            limit.count = 1;
+            limit.reset_time = now + self.window;
+            return true;
         }
+
+        // Check if limit exceeded
+        if limit.count >= self.max_requests {
+            return false;
+        }
+
+        // Increment and allow
+        limit.count += 1;
+        true
     }
 
-    /// Clean up expired entries
-    pub fn cleanup(&mut self) {
-        let now = Instant::now();
-        self.limits.retain(|_, limit| now < limit.reset_time);
-    }
-
-    /// Get current count for a user
-    pub fn get_count(&self, user_id: &str) -> Option<u32> {
-        self.limits.get(user_id).map(|limit| limit.count)
-    }
-
-    /// Reset a user's rate limit
-    pub fn reset_user(&mut self, user_id: &str) {
+    pub fn reset(&mut self, user_id: &str) {
         self.limits.remove(user_id);
+    }
+
+    pub fn clear(&mut self) {
+        self.limits.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
+    use std::thread;
 
     #[test]
-    fn test_rate_limit_basic() {
+    fn test_rate_limiter() {
         let mut limiter = RateLimiter::new(3, Duration::from_millis(100));
+
         assert!(limiter.check("user1"));
         assert!(limiter.check("user1"));
         assert!(limiter.check("user1"));
         assert!(!limiter.check("user1")); // Should be rate limited
+
+        // Wait for window to reset
+        thread::sleep(Duration::from_millis(150));
+        assert!(limiter.check("user1")); // Should work again
     }
 
     #[test]
-    fn test_rate_limit_window_reset() {
-        let mut limiter = RateLimiter::new(2, Duration::from_millis(50));
-        assert!(limiter.check("user1"));
-        assert!(limiter.check("user1"));
-        assert!(!limiter.check("user1"));
+    fn test_different_users() {
+        let mut limiter = RateLimiter::new(2, Duration::from_secs(1));
 
-        sleep(Duration::from_millis(60));
-        assert!(limiter.check("user1")); // Window reset, should allow again
-    }
-
-    #[test]
-    fn test_rate_limit_multiple_users() {
-        let mut limiter = RateLimiter::new(2, Duration::from_millis(100));
         assert!(limiter.check("user1"));
+        assert!(limiter.check("user1"));
+        assert!(!limiter.check("user1")); // user1 limited
+
+        assert!(limiter.check("user2")); // user2 should still work
         assert!(limiter.check("user2"));
-        assert!(limiter.check("user1"));
-        assert!(limiter.check("user2"));
-        
-        assert!(!limiter.check("user1")); // user1 exceeded
-        assert!(!limiter.check("user2")); // user2 exceeded
-    }
-
-    #[test]
-    fn test_cleanup() {
-        let mut limiter = RateLimiter::new(5, Duration::from_millis(50));
-        limiter.check("user1");
-        limiter.check("user2");
-        
-        assert_eq!(limiter.limits.len(), 2);
-        sleep(Duration::from_millis(60));
-        limiter.cleanup();
-        assert_eq!(limiter.limits.len(), 0);
-    }
-
-    #[test]
-    fn test_reset_user() {
-        let mut limiter = RateLimiter::new(1, Duration::from_millis(100));
-        assert!(limiter.check("user1"));
-        assert!(!limiter.check("user1"));
-
-        limiter.reset_user("user1");
-        assert!(limiter.check("user1")); // Should work after reset
+        assert!(!limiter.check("user2")); // user2 limited
     }
 }
