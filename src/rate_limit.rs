@@ -76,7 +76,6 @@ mod tests {
     #[test]
     fn test_rate_limit_basic() {
         let mut limiter = RateLimiter::new(3, Duration::from_millis(100));
-
         assert!(limiter.check("user1"));
         assert!(limiter.check("user1"));
         assert!(limiter.check("user1"));
@@ -86,20 +85,17 @@ mod tests {
     #[test]
     fn test_rate_limit_window_reset() {
         let mut limiter = RateLimiter::new(2, Duration::from_millis(50));
-
         assert!(limiter.check("user1"));
         assert!(limiter.check("user1"));
         assert!(!limiter.check("user1"));
 
         sleep(Duration::from_millis(60));
-
         assert!(limiter.check("user1")); // Window reset, should allow again
     }
 
     #[test]
     fn test_rate_limit_multiple_users() {
         let mut limiter = RateLimiter::new(2, Duration::from_millis(100));
-
         assert!(limiter.check("user1"));
         assert!(limiter.check("user2"));
         assert!(limiter.check("user1"));
@@ -112,27 +108,22 @@ mod tests {
     #[test]
     fn test_cleanup() {
         let mut limiter = RateLimiter::new(5, Duration::from_millis(50));
-
         limiter.check("user1");
         limiter.check("user2");
         
         assert_eq!(limiter.limits.len(), 2);
-
         sleep(Duration::from_millis(60));
         limiter.cleanup();
-
         assert_eq!(limiter.limits.len(), 0);
     }
 
     #[test]
     fn test_reset_user() {
         let mut limiter = RateLimiter::new(1, Duration::from_millis(100));
-
         assert!(limiter.check("user1"));
         assert!(!limiter.check("user1"));
 
         limiter.reset_user("user1");
-
         assert!(limiter.check("user1")); // Should work after reset
     }
 }
