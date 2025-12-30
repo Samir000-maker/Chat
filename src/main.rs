@@ -223,14 +223,20 @@ async fn main() -> anyhow::Result<()> {
         .ping_timeout(Duration::from_secs(60))
         .build_layer();
 
-    io.ns("/", move |socket: SocketRef, state: SocketState<AppState>| {
+    // ✅ CRITICAL FIX: Register ALL event handlers INSIDE the connection handler
+    io.ns("/", |socket: SocketRef, state: SocketState<AppState>| {
         info!("[Worker {}] Client connected: {}", std::process::id(), socket.id);
 
-        let state_clone = state.clone();
+        // Clone state for each handler
+        let state_register = state.clone();
+        let state_message = state.clone();
+        let state_seen = state.clone();
+
+        // ✅ Register "register" event handler
         socket.on(
             "register",
             move |socket: SocketRef, Data::<String>(user_id): Data<String>| {
-                let state = state_clone.clone();
+                let state = state_register.clone();
                 async move {
                     if user_id.is_empty() {
                         let _ = socket.emit("error", &json!({"message": "Invalid userId"}));
@@ -253,11 +259,11 @@ async fn main() -> anyhow::Result<()> {
             },
         );
 
-        let state_clone = state.clone();
+        // ✅ Register "chat message" event handler
         socket.on(
             "chat message",
             move |socket: SocketRef, Data::<ChatMessage>(message): Data<ChatMessage>, ack: AckSender| {
-                let state = state_clone.clone();
+                let state = state_message.clone();
                 async move {
                     info!("[Worker {}] 📨 Received message: {}", std::process::id(), message.message_id);
                     handle_chat_message(socket, message, ack, state).await;
@@ -265,17 +271,18 @@ async fn main() -> anyhow::Result<()> {
             },
         );
 
-        let state_clone = state.clone();
+        // ✅ Register "message_seen" event handler
         socket.on(
             "message_seen",
             move |socket: SocketRef, Data::<MessageSeenEvent>(data): Data<MessageSeenEvent>| {
-                let state = state_clone.clone();
+                let state = state_seen.clone();
                 async move {
                     handle_message_seen(socket, data, state).await;
                 }
             },
         );
 
+        // ✅ Register "typing" event handler
         socket.on(
             "typing",
             |socket: SocketRef, Data::<TypingEvent>(data): Data<TypingEvent>| async move {
@@ -285,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
             },
         );
 
+        // ✅ Register disconnect handler
         socket.on_disconnect(|socket: SocketRef| async move {
             info!("[Worker {}] Client disconnected: {}", std::process::id(), socket.id);
         });
