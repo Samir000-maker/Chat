@@ -33,11 +33,6 @@ use fcm::FcmService;
 use rate_limit::RateLimiter;
 
 
-use socketioxide::{
-    extract::{AckSender, Data, SocketRef, State},  // ✅ Keep State (not SocketState)
-    SocketIo,
-};
-
 // ==================== CONFIGURATION ====================
 
 const RATE_LIMIT: u32 = 100;
