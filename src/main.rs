@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -127,11 +129,15 @@ struct HealthResponse {
 
 #[derive(Clone)]
 struct AppState {
-    redis: ConnectionManager,
+    redis: Option<ConnectionManager>,
     fcm_tokens: Arc<RwLock<HashMap<String, FcmTokenData>>>,
-    fcm_service: Arc<FcmService>,
+    fcm_service: Option<Arc<FcmService>>,
     rate_limiter: Arc<RwLock<RateLimiter>>,
     mongodb_api_url: String,
+    // In-memory fallback storage
+    pending_messages: Arc<RwLock<HashMap<String, Vec<ChatMessage>>>>,
+    pending_seen_events: Arc<RwLock<HashMap<String, Vec<MessageSeenEvent>>>>,
+    message_cache: Arc<RwLock<HashMap<String, ChatMessage>>>,
 }
 
 // ==================== MAIN ====================
@@ -164,20 +170,44 @@ async fn main() -> anyhow::Result<()> {
 
     info!("🚀 Starting Chat Server on port {}", port);
 
-    // Initialize Redis
+    // Initialize Redis (optional)
     info!("📡 Connecting to Redis at {}", redis_url);
-    let redis_client = redis::Client::open(redis_url)?;
-    let redis_conn = ConnectionManager::new(redis_client).await?;
-    info!("✅ Connected to Redis");
+    let redis_conn = match redis::Client::open(redis_url.clone()) {
+        Ok(client) => match ConnectionManager::new(client).await {
+            Ok(conn) => {
+                info!("✅ Connected to Redis");
+                Some(conn)
+            }
+            Err(e) => {
+                warn!("⚠️ Failed to connect to Redis: {}", e);
+                warn!("💡 Using in-memory storage (messages will not persist across restarts)");
+                None
+            }
+        },
+        Err(e) => {
+            warn!("⚠️ Invalid Redis URL: {}", e);
+            warn!("💡 Using in-memory storage (messages will not persist across restarts)");
+            None
+        }
+    };
 
-    // Initialize FCM
+    // Initialize FCM (optional)
     info!("📱 Initializing Firebase Cloud Messaging");
-    let fcm_service = Arc::new(FcmService::new(&fcm_service_account_path)?);
-    info!("✅ Firebase Admin initialized - Project: {}", fcm_service.project_id());
+    let fcm_service = match FcmService::new(&fcm_service_account_path) {
+        Ok(service) => {
+            info!("✅ Firebase Admin initialized - Project: {}", service.project_id());
+            Some(Arc::new(service))
+        }
+        Err(e) => {
+            warn!("⚠️ Failed to initialize FCM: {}", e);
+            warn!("💡 Push notifications will be disabled");
+            None
+        }
+    };
 
     // Initialize shared state
     let state = AppState {
-        redis: redis_conn.clone(),
+        redis: redis_conn,
         fcm_tokens: Arc::new(RwLock::new(HashMap::new())),
         fcm_service,
         rate_limiter: Arc::new(RwLock::new(RateLimiter::new(
@@ -185,6 +215,9 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_millis(RATE_WINDOW_MS),
         ))),
         mongodb_api_url,
+        pending_messages: Arc::new(RwLock::new(HashMap::new())),
+        pending_seen_events: Arc::new(RwLock::new(HashMap::new())),
+        message_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Create Socket.IO layer
@@ -211,12 +244,12 @@ async fn main() -> anyhow::Result<()> {
                 info!("✅ User registered: {} (socket: {})", user_id, socket.id);
 
                 // Replay pending messages
-                if let Err(e) = replay_pending_messages(&socket, &user_id, &state.redis).await {
+                if let Err(e) = replay_pending_messages(&socket, &user_id, &state).await {
                     error!("Failed to replay pending messages for {}: {}", user_id, e);
                 }
 
                 // Replay pending seen events
-                if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state.redis).await {
+                if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state).await {
                     error!("Failed to replay pending seen events for {}: {}", user_id, e);
                 }
             },
@@ -461,20 +494,28 @@ async fn handle_chat_message(
         message.message_id, message.sender_id, message.receiver_id
     );
 
-    // Store message in Redis
-    let msg_key = format!("msg:{}", message.message_id);
-    let msg_json = serde_json::to_string(&message).unwrap();
+    // Store message in Redis or in-memory cache
+    if let Some(redis) = &state.redis {
+        let msg_key = format!("msg:{}", message.message_id);
+        let msg_json = serde_json::to_string(&message).unwrap();
+        let mut redis_conn = redis.clone();
+        let set_result: Result<(), redis::RedisError> = redis::cmd("SETEX")
+            .arg(&msg_key)
+            .arg(MESSAGE_CACHE_TTL)
+            .arg(&msg_json)
+            .query_async(&mut redis_conn)
+            .await;
 
-    let mut redis_conn = state.redis.clone();
-    let set_result: Result<(), redis::RedisError> = redis::cmd("SETEX")
-        .arg(&msg_key)
-        .arg(MESSAGE_CACHE_TTL)
-        .arg(&msg_json)
-        .query_async(&mut redis_conn)
-        .await;
-
-    if let Err(e) = set_result {
-        error!("Failed to store message in Redis: {}", e);
+        if let Err(e) = set_result {
+            error!("Failed to store message in Redis: {}", e);
+        }
+    } else {
+        // Use in-memory cache
+        state
+            .message_cache
+            .write()
+            .await
+            .insert(message.message_id.clone(), message.clone());
     }
 
     // Update recent chats in MongoDB (fire and forget)
@@ -498,27 +539,40 @@ async fn handle_chat_message(
         info!("✅ Message delivered to ONLINE user {}", message.receiver_id);
     } else {
         // Buffer for offline user
-        let pending_key = format!("pending:{}", message.receiver_id);
-        
-        let mut redis_conn = state.redis.clone();
-        let rpush_result: Result<(), redis::RedisError> = redis::cmd("RPUSH")
-            .arg(&pending_key)
-            .arg(&msg_json)
-            .query_async(&mut redis_conn)
-            .await;
+        if let Some(redis) = &state.redis {
+            // Use Redis
+            let pending_key = format!("pending:{}", message.receiver_id);
+            let msg_json = serde_json::to_string(&message).unwrap();
+            let mut redis_conn = redis.clone();
+            
+            let rpush_result: Result<(), redis::RedisError> = redis::cmd("RPUSH")
+                .arg(&pending_key)
+                .arg(&msg_json)
+                .query_async(&mut redis_conn)
+                .await;
 
-        if let Err(e) = rpush_result {
-            error!("Failed to buffer message: {}", e);
-        }
+            if let Err(e) = rpush_result {
+                error!("Failed to buffer message: {}", e);
+            }
 
-        let expire_result: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
-            .arg(&pending_key)
-            .arg(MESSAGE_CACHE_TTL)
-            .query_async(&mut redis_conn)
-            .await;
+            let expire_result: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
+                .arg(&pending_key)
+                .arg(MESSAGE_CACHE_TTL)
+                .query_async(&mut redis_conn)
+                .await;
 
-        if let Err(e) = expire_result {
-            error!("Failed to set expiry on pending messages: {}", e);
+            if let Err(e) = expire_result {
+                error!("Failed to set expiry on pending messages: {}", e);
+            }
+        } else {
+            // Use in-memory storage
+            state
+                .pending_messages
+                .write()
+                .await
+                .entry(message.receiver_id.clone())
+                .or_insert_with(Vec::new)
+                .push(message.clone());
         }
 
         info!("📦 Buffered message for OFFLINE user {}", message.receiver_id);
@@ -528,35 +582,39 @@ async fn handle_chat_message(
         
         let tokens = state.fcm_tokens.read().await;
         if let Some(token_data) = tokens.get(&message.receiver_id) {
-            let sender_name = message.sender_username.clone().unwrap_or_else(|| "Someone".to_string());
-            let content = message.content.clone();
-            
-            let fcm_service = state.fcm_service.clone();
-            let receiver_id = message.receiver_id.clone();
-            let chat_id = message.chat_id.clone();
-            let sender_id = message.sender_id.clone();
-            let token = token_data.token.clone();
-            
-            tokio::spawn(async move {
-                match send_push_notification(
-                    &fcm_service,
-                    &receiver_id,
-                    &sender_name,
-                    &content,
-                    &chat_id,
-                    &sender_id,
-                    &token,
-                )
-                .await
-                {
-                    Ok(message_id) => {
-                        info!("✅ Push notification sent - FCM ID: {}", message_id);
+            if let Some(fcm_service) = &state.fcm_service {
+                let sender_name = message.sender_username.clone().unwrap_or_else(|| "Someone".to_string());
+                let content = message.content.clone();
+                
+                let fcm_service_clone = fcm_service.clone();
+                let receiver_id = message.receiver_id.clone();
+                let chat_id = message.chat_id.clone();
+                let sender_id = message.sender_id.clone();
+                let token = token_data.token.clone();
+                
+                tokio::spawn(async move {
+                    match send_push_notification(
+                        &fcm_service_clone,
+                        &receiver_id,
+                        &sender_name,
+                        &content,
+                        &chat_id,
+                        &sender_id,
+                        &token,
+                    )
+                    .await
+                    {
+                        Ok(message_id) => {
+                            info!("✅ Push notification sent - FCM ID: {}", message_id);
+                        }
+                        Err(e) => {
+                            warn!("⚠️ Push notification failed: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        warn!("⚠️ Push notification failed: {}", e);
-                    }
-                }
-            });
+                });
+            } else {
+                warn!("⚠️ FCM service not available");
+            }
         } else {
             warn!("⚠️ No FCM token found for user: {}", message.receiver_id);
         }
@@ -591,28 +649,41 @@ async fn handle_message_seen(
     info!("👁️ Message seen: {} by {}", data.message_id, data.user_id);
 
     // Get original message to find sender
-    let msg_key = format!("msg:{}", data.message_id);
-    let mut redis_conn = state.redis.clone();
-    let msg_str: Result<Option<String>, redis::RedisError> = redis::cmd("GET")
-        .arg(&msg_key)
-        .query_async(&mut redis_conn)
-        .await;
+    let sender_id = if let Some(redis) = &state.redis {
+        // Use Redis
+        let msg_key = format!("msg:{}", data.message_id);
+        let mut redis_conn = redis.clone();
+        let msg_str: Result<Option<String>, redis::RedisError> = redis::cmd("GET")
+            .arg(&msg_key)
+            .query_async(&mut redis_conn)
+            .await;
 
-    let sender_id = match msg_str {
-        Ok(Some(s)) => match serde_json::from_str::<ChatMessage>(&s) {
-            Ok(msg) => msg.sender_id,
-            Err(e) => {
-                error!("Failed to parse cached message: {}", e);
+        match msg_str {
+            Ok(Some(s)) => match serde_json::from_str::<ChatMessage>(&s) {
+                Ok(msg) => msg.sender_id,
+                Err(e) => {
+                    error!("Failed to parse cached message: {}", e);
+                    return;
+                }
+            },
+            Ok(None) => {
+                warn!("Message {} not found in cache", data.message_id);
                 return;
             }
-        },
-        Ok(None) => {
-            warn!("Message {} not found in cache", data.message_id);
-            return;
+            Err(e) => {
+                error!("Failed to get message from Redis: {}", e);
+                return;
+            }
         }
-        Err(e) => {
-            error!("Failed to get message from Redis: {}", e);
-            return;
+    } else {
+        // Use in-memory cache
+        let cache = state.message_cache.read().await;
+        match cache.get(&data.message_id) {
+            Some(msg) => msg.sender_id.clone(),
+            None => {
+                warn!("Message {} not found in cache", data.message_id);
+                return;
+            }
         }
     };
 
@@ -636,28 +707,40 @@ async fn handle_message_seen(
         let _: Result<(), _> = socket.within(sender_id.clone()).emit("message_seen", &evt);
     } else {
         // Buffer for offline sender
-        let pending_key = format!("pending_seen:{}", sender_id);
-        let evt_json = serde_json::to_string(&evt).unwrap();
+        if let Some(redis) = &state.redis {
+            // Use Redis
+            let pending_key = format!("pending_seen:{}", sender_id);
+            let evt_json = serde_json::to_string(&evt).unwrap();
+            let mut redis_conn = redis.clone();
 
-        let mut redis_conn = state.redis.clone();
-        let rpush_result: Result<(), redis::RedisError> = redis::cmd("RPUSH")
-            .arg(&pending_key)
-            .arg(&evt_json)
-            .query_async(&mut redis_conn)
-            .await;
+            let rpush_result: Result<(), redis::RedisError> = redis::cmd("RPUSH")
+                .arg(&pending_key)
+                .arg(&evt_json)
+                .query_async(&mut redis_conn)
+                .await;
 
-        if let Err(e) = rpush_result {
-            error!("Failed to buffer seen event: {}", e);
-        }
+            if let Err(e) = rpush_result {
+                error!("Failed to buffer seen event: {}", e);
+            }
 
-        let expire_result: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
-            .arg(&pending_key)
-            .arg(MESSAGE_CACHE_TTL)
-            .query_async(&mut redis_conn)
-            .await;
+            let expire_result: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
+                .arg(&pending_key)
+                .arg(MESSAGE_CACHE_TTL)
+                .query_async(&mut redis_conn)
+                .await;
 
-        if let Err(e) = expire_result {
-            error!("Failed to set expiry on pending seen events: {}", e);
+            if let Err(e) = expire_result {
+                error!("Failed to set expiry on pending seen events: {}", e);
+            }
+        } else {
+            // Use in-memory storage
+            state
+                .pending_seen_events
+                .write()
+                .await
+                .entry(sender_id.clone())
+                .or_insert_with(Vec::new)
+                .push(evt);
         }
     }
 }
@@ -667,30 +750,41 @@ async fn handle_message_seen(
 async fn replay_pending_messages(
     socket: &SocketRef,
     user_id: &str,
-    redis: &ConnectionManager,
+    state: &AppState,
 ) -> anyhow::Result<()> {
-    let pending_key = format!("pending:{}", user_id);
-    
-    let mut redis_conn = redis.clone();
-    let messages: Vec<String> = redis::cmd("LRANGE")
-        .arg(&pending_key)
-        .arg(0)
-        .arg(-1)
-        .query_async(&mut redis_conn)
-        .await?;
+    let messages = if let Some(redis) = &state.redis {
+        // Use Redis
+        let pending_key = format!("pending:{}", user_id);
+        let mut redis_conn = redis.clone();
+        let messages: Vec<String> = redis::cmd("LRANGE")
+            .arg(&pending_key)
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut redis_conn)
+            .await?;
 
-    for msg_str in &messages {
-        if let Ok(msg) = serde_json::from_str::<ChatMessage>(msg_str) {
-            let _: Result<(), _> = socket.emit("chat message", &msg);
+        if !messages.is_empty() {
+            let _: () = redis::cmd("DEL")
+                .arg(&pending_key)
+                .query_async(&mut redis_conn)
+                .await?;
         }
+
+        messages
+            .iter()
+            .filter_map(|s| serde_json::from_str::<ChatMessage>(s).ok())
+            .collect()
+    } else {
+        // Use in-memory storage
+        let mut pending = state.pending_messages.write().await;
+        pending.remove(user_id).unwrap_or_default()
+    };
+
+    for msg in &messages {
+        let _: Result<(), _> = socket.emit("chat message", msg);
     }
 
     if !messages.is_empty() {
-        let _: () = redis::cmd("DEL")
-            .arg(&pending_key)
-            .query_async(&mut redis_conn)
-            .await?;
-        
         info!("📬 Replayed {} pending messages for {}", messages.len(), user_id);
     }
 
@@ -700,30 +794,41 @@ async fn replay_pending_messages(
 async fn replay_pending_seen_events(
     socket: &SocketRef,
     user_id: &str,
-    redis: &ConnectionManager,
+    state: &AppState,
 ) -> anyhow::Result<()> {
-    let pending_key = format!("pending_seen:{}", user_id);
-    
-    let mut redis_conn = redis.clone();
-    let events: Vec<String> = redis::cmd("LRANGE")
-        .arg(&pending_key)
-        .arg(0)
-        .arg(-1)
-        .query_async(&mut redis_conn)
-        .await?;
+    let events = if let Some(redis) = &state.redis {
+        // Use Redis
+        let pending_key = format!("pending_seen:{}", user_id);
+        let mut redis_conn = redis.clone();
+        let events: Vec<String> = redis::cmd("LRANGE")
+            .arg(&pending_key)
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut redis_conn)
+            .await?;
 
-    for evt_str in &events {
-        if let Ok(evt) = serde_json::from_str::<MessageSeenEvent>(evt_str) {
-            let _: Result<(), _> = socket.emit("message_seen", &evt);
+        if !events.is_empty() {
+            let _: () = redis::cmd("DEL")
+                .arg(&pending_key)
+                .query_async(&mut redis_conn)
+                .await?;
         }
+
+        events
+            .iter()
+            .filter_map(|s| serde_json::from_str::<MessageSeenEvent>(s).ok())
+            .collect()
+    } else {
+        // Use in-memory storage
+        let mut pending = state.pending_seen_events.write().await;
+        pending.remove(user_id).unwrap_or_default()
+    };
+
+    for evt in &events {
+        let _: Result<(), _> = socket.emit("message_seen", evt);
     }
 
     if !events.is_empty() {
-        let _: () = redis::cmd("DEL")
-            .arg(&pending_key)
-            .query_async(&mut redis_conn)
-            .await?;
-        
         info!("👁️ Replayed {} pending seen events for {}", events.len(), user_id);
     }
 
