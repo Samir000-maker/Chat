@@ -9,6 +9,7 @@ use axum::{
 };
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use socketioxide::{
     extract::{AckSender, Data, SocketRef, State as SocketState},
     SocketIo,
@@ -167,7 +168,6 @@ async fn main() -> anyhow::Result<()> {
     info!("🚀 Starting Chat Server on port {}", port);
     info!("📱 Looking for FCM service account at: {}", fcm_service_account_path);
 
-    // Initialize Redis
     info!("📡 Connecting to Redis at {}", redis_url);
     let redis_conn = match redis::Client::open(redis_url.clone()) {
         Ok(client) => match ConnectionManager::new(client).await {
@@ -188,7 +188,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Initialize FCM
     info!("📱 Initializing Firebase Cloud Messaging");
     let fcm_service = match FcmService::new(&fcm_service_account_path) {
         Ok(service) => {
@@ -217,7 +216,6 @@ async fn main() -> anyhow::Result<()> {
         message_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    // Create Socket.IO layer
     let (socket_layer, io) = SocketIo::builder()
         .with_state(state.clone())
         .max_buffer_size(1024 * 1024)
@@ -225,11 +223,9 @@ async fn main() -> anyhow::Result<()> {
         .ping_timeout(Duration::from_secs(60))
         .build_layer();
 
-    // Configure Socket.IO namespace
     io.ns("/", move |socket: SocketRef, state: SocketState<AppState>| {
         info!("[Worker {}] Client connected: {}", std::process::id(), socket.id);
 
-        // Register event
         let state_clone = state.clone();
         socket.on(
             "register",
@@ -237,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
                 let state = state_clone.clone();
                 async move {
                     if user_id.is_empty() {
-                        let _ = socket.emit("error", json!({"message": "Invalid userId"}));
+                        let _ = socket.emit("error", &json!({"message": "Invalid userId"}));
                         return;
                     }
 
@@ -257,7 +253,6 @@ async fn main() -> anyhow::Result<()> {
             },
         );
 
-        // Chat message event - CRITICAL: Data extractor AFTER other extractors
         let state_clone = state.clone();
         socket.on(
             "chat message",
@@ -270,7 +265,6 @@ async fn main() -> anyhow::Result<()> {
             },
         );
 
-        // Message seen event
         let state_clone = state.clone();
         socket.on(
             "message_seen",
@@ -282,7 +276,6 @@ async fn main() -> anyhow::Result<()> {
             },
         );
 
-        // Typing event
         socket.on(
             "typing",
             |socket: SocketRef, Data::<TypingEvent>(data): Data<TypingEvent>| async move {
@@ -297,7 +290,6 @@ async fn main() -> anyhow::Result<()> {
         });
     });
 
-    // Build HTTP router
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/register-fcm-token", post(register_fcm_token))
@@ -377,10 +369,7 @@ async fn register_fcm_token(
 
     let token_count = state.fcm_tokens.read().await.len();
 
-    info!(
-        "✅ FCM token registered for user: {}",
-        req.user_id
-    );
+    info!("✅ FCM token registered for user: {}", req.user_id);
     info!("   Token: {}...", &req.token[..20.min(req.token.len())]);
     info!("   Total registered tokens: {}", token_count);
 
@@ -473,7 +462,6 @@ async fn handle_chat_message(
     info!("[Worker {}] Message {}: {} -> {}", 
         worker_id, message.message_id, message.sender_id, message.receiver_id);
     
-    // Validation
     if message.sender_id.is_empty()
         || message.receiver_id.is_empty()
         || message.chat_id.is_empty()
@@ -488,7 +476,6 @@ async fn handle_chat_message(
         return;
     }
 
-    // Rate limiting
     {
         let mut limiter = state.rate_limiter.write().await;
         if !limiter.check(&message.sender_id) {
@@ -502,7 +489,6 @@ async fn handle_chat_message(
         }
     }
 
-    // Store message in cache
     if let Some(redis) = &state.redis {
         let msg_key = format!("msg:{}", message.message_id);
         let msg_json = serde_json::to_string(&message).unwrap();
@@ -525,7 +511,6 @@ async fn handle_chat_message(
             .insert(message.message_id.clone(), message.clone());
     }
 
-    // Update recent chats in MongoDB (fire and forget)
     let mongodb_url = state.mongodb_api_url.clone();
     let msg_clone = message.clone();
     tokio::spawn(async move {
@@ -534,12 +519,10 @@ async fn handle_chat_message(
         }
     });
 
-    // Check if receiver is online
     let receiver_sockets = socket.within(message.receiver_id.clone()).sockets().unwrap_or_default();
     let is_receiver_online = !receiver_sockets.is_empty();
 
     if is_receiver_online {
-        // Deliver to online user
         let _ = socket
             .within(message.receiver_id.clone())
             .emit("chat message", &message);
@@ -548,7 +531,6 @@ async fn handle_chat_message(
             worker_id, message.receiver_id
         );
     } else {
-        // Buffer for offline user
         if let Some(redis) = &state.redis {
             let pending_key = format!("pending:{}", message.receiver_id);
             let msg_json = serde_json::to_string(&message).unwrap();
@@ -576,8 +558,6 @@ async fn handle_chat_message(
         }
 
         info!("[Worker {}] 📦 Buffered message for OFFLINE user {}", worker_id, message.receiver_id);
-
-        // Send push notification
         info!("[Worker {}] 📲 Sending push notification to {}...", worker_id, message.receiver_id);
         
         let tokens = state.fcm_tokens.read().await;
@@ -622,7 +602,6 @@ async fn handle_chat_message(
         }
     }
 
-    // Send acknowledgment
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -859,7 +838,7 @@ async fn update_recent_chats_in_mongodb(
 
 async fn send_push_notification(
     fcm_service: &FcmService,
-    receiver_user_id: &str,
+    _receiver_user_id: &str,
     sender_name: &str,
     message_text: &str,
     chat_id: &str,
@@ -872,7 +851,6 @@ async fn send_push_notification(
 
     let mut notification_text = message_text.to_string();
 
-    // Check if message appears encrypted
     let is_encrypted = message_text.len() > 40
         && message_text.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=')
         && !message_text.contains(' ');
@@ -893,7 +871,6 @@ async fn send_push_notification(
         info!("[Worker {}] Message does not appear encrypted", worker_id);
     }
 
-    // Truncate long messages
     if notification_text.len() > 100 {
         notification_text = format!("{}...", &notification_text[..97]);
     }
@@ -916,11 +893,4 @@ async fn send_push_notification(
         .await?;
 
     Ok(message_id)
-}
-
-#[macro_export]
-macro_rules! json {
-    ($($json:tt)+) => {
-        serde_json::json!($($json)+)
-    };
 }
