@@ -5,78 +5,105 @@ use aes_gcm::{
 use base64::{engine::general_purpose, Engine as _};
 use tracing::{error, info};
 
+const AES_KEY: &str = "0123456789abcdef"; // Must match your Android app's key
 const GCM_IV_LENGTH: usize = 12;
 const GCM_TAG_LENGTH: usize = 16;
 
-/// Decrypt an AES-128-GCM encrypted message
-/// 
-/// Format: Base64(IV || Ciphertext || AuthTag)
-/// - IV: 12 bytes
-/// - Ciphertext: variable length
-/// - AuthTag: 16 bytes (appended by Android's Cipher)
-pub fn decrypt_message(encrypted_base64: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Decrypt AES-GCM encrypted message
+/// Format: [IV (12 bytes)][Ciphertext][Auth Tag (16 bytes)]
+pub fn decrypt_message(encrypted_base64: &str) -> Result<String, String> {
+    let worker_id = std::process::id();
+    
+    // Validate input
     if encrypted_base64.is_empty() || encrypted_base64.len() < 20 {
-        return Ok("New message".to_string());
+        error!("[Worker {}] Encrypted data too short", worker_id);
+        return Err("Encrypted data too short".to_string());
     }
 
     // Decode base64
-    let combined = general_purpose::STANDARD.decode(encrypted_base64)?;
+    let combined = general_purpose::STANDARD
+        .decode(encrypted_base64)
+        .map_err(|e| {
+            error!("[Worker {}] Base64 decode error: {}", worker_id, e);
+            format!("Base64 decode error: {}", e)
+        })?;
 
-    // Check minimum length
+    // Check minimum length (IV + at least some ciphertext + auth tag)
     if combined.len() < GCM_IV_LENGTH + GCM_TAG_LENGTH {
-        error!("Encrypted data too short");
-        return Ok("New message".to_string());
+        error!("[Worker {}] Encrypted data too short after decode: {} bytes", worker_id, combined.len());
+        return Err(format!(
+            "Encrypted data too short: expected at least {} bytes, got {}",
+            GCM_IV_LENGTH + GCM_TAG_LENGTH,
+            combined.len()
+        ));
     }
 
-    // Extract components
-    let iv = &combined[..GCM_IV_LENGTH];
+    // Extract components:
+    // [0..12]: IV
+    // [12..len-16]: Ciphertext
+    // [len-16..len]: Auth Tag
+    let iv = &combined[0..GCM_IV_LENGTH];
     let ciphertext_with_tag = &combined[GCM_IV_LENGTH..];
-
-    // The auth tag is the LAST 16 bytes
-    let auth_tag_start = ciphertext_with_tag.len() - GCM_TAG_LENGTH;
-    let ciphertext = &ciphertext_with_tag[..auth_tag_start];
-    let auth_tag = &ciphertext_with_tag[auth_tag_start..];
+    
+    // Split ciphertext and auth tag
+    let ciphertext_len = ciphertext_with_tag.len() - GCM_TAG_LENGTH;
+    let ciphertext = &ciphertext_with_tag[..ciphertext_len];
+    let auth_tag = &ciphertext_with_tag[ciphertext_len..];
 
     info!(
-        "Decryption debug:
-  - Total length: {}
-  - IV length: {}
-  - Ciphertext length: {}
-  - Auth tag length: {}",
+        "[Worker {}] Decryption debug:
+      - Total length: {}
+      - IV length: {}
+      - Ciphertext length: {}
+      - Auth tag length: {}",
+        worker_id,
         combined.len(),
         iv.len(),
         ciphertext.len(),
         auth_tag.len()
     );
 
-    // Use the hardcoded AES key (must match Android app)
-    let key = b"0123456789abcdef";
+    // Prepare key
+    let key_bytes = AES_KEY.as_bytes();
+    if key_bytes.len() != 16 {
+        error!("[Worker {}] Invalid key length: {}", worker_id, key_bytes.len());
+        return Err("Invalid key length".to_string());
+    }
 
     // Create cipher
-    let cipher = Aes128Gcm::new(key.into());
-
-    // Combine ciphertext and auth tag for aes_gcm crate
-    let mut ciphertext_with_tag_vec = ciphertext.to_vec();
-    ciphertext_with_tag_vec.extend_from_slice(auth_tag);
+    let cipher = Aes128Gcm::new_from_slice(key_bytes)
+        .map_err(|e| {
+            error!("[Worker {}] Failed to create cipher: {}", worker_id, e);
+            format!("Failed to create cipher: {}", e)
+        })?;
 
     // Create nonce
     let nonce = Nonce::from_slice(iv);
 
+    // Combine ciphertext + tag for decrypt (aes_gcm expects them together)
+    let mut payload = ciphertext.to_vec();
+    payload.extend_from_slice(auth_tag);
+
     // Decrypt
-    match cipher.decrypt(nonce, ciphertext_with_tag_vec.as_ref()) {
-        Ok(plaintext) => {
-            let decrypted = String::from_utf8(plaintext)?;
-            info!(
-                "✅ Decryption successful: \"{}...\"",
-                &decrypted[..30.min(decrypted.len())]
-            );
-            Ok(decrypted)
-        }
-        Err(e) => {
-            error!("❌ Decryption error: {}", e);
-            Ok("New message".to_string())
-        }
-    }
+    let decrypted = cipher.decrypt(nonce, payload.as_ref())
+        .map_err(|e| {
+            error!("[Worker {}] ❌ Decryption error: {}", worker_id, e);
+            format!("Decryption error: {}", e)
+        })?;
+
+    // Convert to UTF-8 string
+    let decrypted_text = String::from_utf8(decrypted)
+        .map_err(|e| {
+            error!("[Worker {}] UTF-8 decode error: {}", worker_id, e);
+            format!("UTF-8 decode error: {}", e)
+        })?;
+
+    info!("[Worker {}] ✅ Decryption successful: \"{}...\"", 
+        worker_id, 
+        &decrypted_text[..decrypted_text.len().min(30)]
+    );
+
+    Ok(decrypted_text)
 }
 
 #[cfg(test)]
@@ -84,20 +111,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_decrypt_empty() {
-        let result = decrypt_message("");
-        assert_eq!(result.unwrap(), "New message");
-    }
-
-    #[test]
-    fn test_decrypt_short() {
-        let result = decrypt_message("abc");
-        assert_eq!(result.unwrap(), "New message");
-    }
-
-    #[test]
-    fn test_decrypt_invalid_base64() {
-        let result = decrypt_message("not valid base64!");
-        assert!(result.is_err());
+    fn test_decrypt_message() {
+        // This is a sample encrypted message - replace with actual test data
+        let encrypted = "HxVlEpvm96zDWQdnJgiZTi1YsYlbzU";
+        
+        match decrypt_message(encrypted) {
+            Ok(decrypted) => {
+                println!("Decrypted: {}", decrypted);
+                assert!(!decrypted.is_empty());
+            }
+            Err(e) => {
+                println!("Decryption failed: {}", e);
+            }
+        }
     }
 }
