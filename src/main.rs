@@ -206,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 socket.leave_all().ok();
-                socket.join(&user_id).ok();
+                socket.join(user_id).ok();
                 
                 info!("✅ User registered: {} (socket: {})", user_id, socket.id);
 
@@ -243,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
             "typing",
             |socket: SocketRef, Data::<TypingEvent>(data)| async move {
                 if !data.receiver_id.is_empty() {
-                    socket.to(&data.receiver_id).emit("typing", &data).ok();
+                    socket.to(data.receiver_id.as_str()).emit("typing", &data).ok();
                 }
             },
         );
