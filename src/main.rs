@@ -32,6 +32,12 @@ use crypto::decrypt_message;
 use fcm::FcmService;
 use rate_limit::RateLimiter;
 
+
+use socketioxide::{
+    extract::{AckSender, Data, SocketRef, State},  // ✅ Keep State (not SocketState)
+    SocketIo,
+};
+
 // ==================== CONFIGURATION ====================
 
 const RATE_LIMIT: u32 = 100;
@@ -231,7 +237,7 @@ io.ns("/", |socket: SocketRef| {
     // Handler 1: register
     socket.on(
         "register",
-        |socket: SocketRef, Data::<String>(user_id): Data<String>| async move {
+        |socket: SocketRef, Data::<String>(user_id): Data<String>, State(state): State<AppState>| async move {
             if user_id.is_empty() {
                 let _ = socket.emit("error", &json!({"message": "Invalid userId"}));
                 return;
@@ -241,8 +247,6 @@ io.ns("/", |socket: SocketRef| {
             let _ = socket.join(user_id.clone());
             
             info!("[Worker {}] User registered: {}", std::process::id(), user_id);
-
-            let state = socket.req_parts().extensions.get::<AppState>().unwrap().clone();
 
             if let Err(e) = replay_pending_messages(&socket, &user_id, &state).await {
                 error!("Failed to replay pending messages for {}: {}", user_id, e);
@@ -257,11 +261,8 @@ io.ns("/", |socket: SocketRef| {
     // Handler 2: chat message
     socket.on(
         "chat message",
-        |socket: SocketRef, Data::<ChatMessage>(message): Data<ChatMessage>, ack: AckSender| async move {
+        |socket: SocketRef, Data::<ChatMessage>(message): Data<ChatMessage>, ack: AckSender, State(state): State<AppState>| async move {
             info!("[Worker {}] 📨 Received message: {}", std::process::id(), message.message_id);
-            
-            let state = socket.req_parts().extensions.get::<AppState>().unwrap().clone();
-            
             handle_chat_message(socket, message, ack, state).await;
         },
     );
@@ -269,9 +270,7 @@ io.ns("/", |socket: SocketRef| {
     // Handler 3: message_seen
     socket.on(
         "message_seen",
-        |socket: SocketRef, Data::<MessageSeenEvent>(data): Data<MessageSeenEvent>| async move {
-            let state = socket.req_parts().extensions.get::<AppState>().unwrap().clone();
-            
+        |socket: SocketRef, Data::<MessageSeenEvent>(data): Data<MessageSeenEvent>, State(state): State<AppState>| async move {
             handle_message_seen(socket, data, state).await;
         },
     );
