@@ -193,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
         .build_layer();
 
     // Configure Socket.IO event handlers
-    io.ns("/", |socket: SocketRef, state: SocketState<AppState>| {
+    io.ns("/", |socket: SocketRef, _state: SocketState<AppState>| {
         info!("🔌 Client connected: {}", socket.id);
 
         // Register event
@@ -243,7 +243,8 @@ async fn main() -> anyhow::Result<()> {
             "typing",
             |socket: SocketRef, Data::<TypingEvent>(data)| async move {
                 if !data.receiver_id.is_empty() {
-                    let _: Result<(), _> = socket.to(data.receiver_id.as_str()).emit("typing", &data);
+                    let receiver_id = data.receiver_id.clone();
+                    let _: Result<(), _> = socket.to(receiver_id).emit("typing", &data);
                 }
             },
         );
@@ -486,13 +487,13 @@ async fn handle_chat_message(
     });
 
     // Check if receiver is online
-    let receiver_sockets = socket.within(&message.receiver_id).sockets().unwrap_or_default();
+    let receiver_sockets = socket.within(message.receiver_id.clone()).sockets().unwrap_or_default();
     let is_receiver_online = !receiver_sockets.is_empty();
 
     if is_receiver_online {
         // Deliver to online user
         let _: Result<(), _> = socket
-            .within(&message.receiver_id)
+            .within(message.receiver_id.clone())
             .emit("chat message", &message);
         info!("✅ Message delivered to ONLINE user {}", message.receiver_id);
     } else {
@@ -628,11 +629,11 @@ async fn handle_message_seen(
     };
 
     // Check if sender is online
-    let sender_sockets = socket.within(&sender_id).sockets().unwrap_or_default();
+    let sender_sockets = socket.within(sender_id.clone()).sockets().unwrap_or_default();
     let is_sender_online = !sender_sockets.is_empty();
 
     if is_sender_online {
-        let _: Result<(), _> = socket.within(&sender_id).emit("message_seen", &evt);
+        let _: Result<(), _> = socket.within(sender_id.clone()).emit("message_seen", &evt);
     } else {
         // Buffer for offline sender
         let pending_key = format!("pending_seen:{}", sender_id);
