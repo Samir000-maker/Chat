@@ -10,11 +10,12 @@ use axum::{
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use socketioxide::{
-    extract::{Data, SocketRef, State as SocketState},
+    extract::{AckSender, Data, SocketRef, State as SocketState},
     SocketIo,
 };
 use std::{
     collections::HashMap,
+    process,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -166,9 +167,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "https://server1-ki1x.onrender.com/api".to_string());
 
     let fcm_service_account_path = std::env::var("FCM_SERVICE_ACCOUNT_PATH")
-        .unwrap_or_else(|_| "fcm-service-account.json".to_string());
+        .unwrap_or_else(|_| "./fcm-service-account.json".to_string());
 
     info!("🚀 Starting Chat Server on port {}", port);
+    info!("📱 Looking for FCM service account at: {}", fcm_service_account_path);
 
     // Initialize Redis (optional)
     info!("📡 Connecting to Redis at {}", redis_url);
@@ -193,14 +195,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize FCM (optional)
     info!("📱 Initializing Firebase Cloud Messaging");
+    info!("🔍 Looking for FCM service account at: {}", fcm_service_account_path);
+    
     let fcm_service = match FcmService::new(&fcm_service_account_path) {
         Ok(service) => {
             info!("✅ Firebase Admin initialized - Project: {}", service.project_id());
+            info!("✅ FCM service is READY and functional");
             Some(Arc::new(service))
         }
         Err(e) => {
             warn!("⚠️ Failed to initialize FCM: {}", e);
+            warn!("⚠️ FCM service account path tried: {}", fcm_service_account_path);
             warn!("💡 Push notifications will be disabled");
+            warn!("💡 To enable FCM, ensure fcm-service-account.json exists at: {}", fcm_service_account_path);
             None
         }
     };
@@ -258,8 +265,10 @@ async fn main() -> anyhow::Result<()> {
         // Chat message event
         socket.on(
             "chat message",
-            |socket: SocketRef, Data::<ChatMessage>(message), state: SocketState<AppState>| async move {
-                handle_chat_message(socket, message, state).await;
+            |socket: SocketRef, Data::<ChatMessage>(message), ack: AckSender, state: SocketState<AppState>| async move {
+                info!("[Worker {}] 🔔 CHAT MESSAGE EVENT TRIGGERED!", process::id());
+                info!("[Worker {}] 📨 Received message: {}", process::id(), message.message_id);
+                handle_chat_message(socket, message, ack, state).await;
             },
         );
 
@@ -454,39 +463,52 @@ async fn get_recent_chats(
 async fn handle_chat_message(
     socket: SocketRef,
     message: ChatMessage,
+    ack: AckSender,
     state: SocketState<AppState>,
 ) {
+    info!("[Worker {}] 🎯 handle_chat_message FUNCTION CALLED", process::id());
+    info!("[Worker {}] 📦 Message data: sender={}, receiver={}, messageId={}", 
+        process::id(), message.sender_id, message.receiver_id, message.message_id);
+    
     // Validation
     if message.sender_id.is_empty()
         || message.receiver_id.is_empty()
         || message.chat_id.is_empty()
         || message.message_id.is_empty()
     {
-        error!("Invalid message structure");
-        let _: Result<(), _> = socket.emit(
-            "ack",
-            &ErrorResponse {
-                status: "error".to_string(),
-                message: "Invalid message structure".to_string(),
-            },
-        );
+        error!("[Worker {}] ❌ Invalid message structure - missing required fields", process::id());
+        let error_response = ErrorResponse {
+            status: "error".to_string(),
+            message: "Invalid message structure".to_string(),
+        };
+        let _ = ack.send(&error_response);
         return;
     }
 
+    info!("[Worker {}] ✅ Message validated successfully", process::id());
+
     // Rate limiting
     {
+        info!("[Worker {}] 🚦 Checking rate limit for user: {}", process::id(), message.sender_id);
         let mut limiter = state.rate_limiter.write().await;
         if !limiter.check(&message.sender_id) {
-            warn!("Rate limit exceeded for {}", message.sender_id);
-            let _: Result<(), _> = socket.emit(
-                "ack",
-                &ErrorResponse {
-                    status: "error".to_string(),
+            warn!("[Worker {}] ⚠️ Rate limit exceeded for {}", process::id(), message.sender_id);
+            let error_response = ErrorResponse {
+                status: "error".to_string(),
+                message: "Rate limit exceeded".to_string(),
+            };
+            let _ = ack.send(&error_response);
+            return;
+        }
+    }
+
+    info!("[Worker {}] ✅ Rate limit check passed", process::id());
                     message: "Rate limit exceeded".to_string(),
                 },
             );
             return;
         }
+        info!("✅ Rate limit check passed");
     }
 
     info!(
@@ -495,7 +517,9 @@ async fn handle_chat_message(
     );
 
     // Store message in Redis or in-memory cache
+    info!("💾 Storing message in cache...");
     if let Some(redis) = &state.redis {
+        info!("📍 Using Redis for message storage");
         let msg_key = format!("msg:{}", message.message_id);
         let msg_json = serde_json::to_string(&message).unwrap();
         let mut redis_conn = redis.clone();
@@ -507,15 +531,18 @@ async fn handle_chat_message(
             .await;
 
         if let Err(e) = set_result {
-            error!("Failed to store message in Redis: {}", e);
+            error!("❌ Failed to store message in Redis: {}", e);
+        } else {
+            info!("✅ Message stored in Redis");
         }
     } else {
-        // Use in-memory cache
+        info!("📍 Using in-memory cache for message storage");
         state
             .message_cache
             .write()
             .await
             .insert(message.message_id.clone(), message.clone());
+        info!("✅ Message stored in memory");
     }
 
     // Update recent chats in MongoDB (fire and forget)
@@ -531,12 +558,23 @@ async fn handle_chat_message(
     let receiver_sockets = socket.within(message.receiver_id.clone()).sockets().unwrap_or_default();
     let is_receiver_online = !receiver_sockets.is_empty();
 
+    info!(
+        "[Worker {}] 📡 Receiver {} is {}",
+        process::id(),
+        message.receiver_id,
+        if is_receiver_online { "ONLINE" } else { "OFFLINE" }
+    );
+
     if is_receiver_online {
         // Deliver to online user
         let _: Result<(), _> = socket
             .within(message.receiver_id.clone())
             .emit("chat message", &message);
-        info!("✅ Message delivered to ONLINE user {}", message.receiver_id);
+        info!(
+            "[Worker {}] ✅ Message delivered to ONLINE user {}",
+            process::id(),
+            message.receiver_id
+        );
     } else {
         // Buffer for offline user
         if let Some(redis) = &state.redis {
@@ -575,10 +613,10 @@ async fn handle_chat_message(
                 .push(message.clone());
         }
 
-        info!("📦 Buffered message for OFFLINE user {}", message.receiver_id);
+        info!("[Worker {}] 📦 Buffered message for OFFLINE user {}", process::id(), message.receiver_id);
 
         // Send push notification
-        info!("📲 Sending push notification to {}...", message.receiver_id);
+        info!("[Worker {}] 📲 Sending push notification to {}...", process::id(), message.receiver_id);
         
         let tokens = state.fcm_tokens.read().await;
         if let Some(token_data) = tokens.get(&message.receiver_id) {
@@ -620,20 +658,27 @@ async fn handle_chat_message(
         }
     }
 
-    // Send acknowledgment
+    // Send acknowledgment via AckSender
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
 
-    let _: Result<(), _> = socket.emit(
-        "ack",
-        &MessageAck {
-            status: "delivered".to_string(),
-            message_id: message.message_id.clone(),
-            timestamp: now,
-        },
-    );
+    let ack_response = MessageAck {
+        status: "delivered".to_string(),
+        message_id: message.message_id.clone(),
+        timestamp: now,
+    };
+
+    if let Err(e) = ack.send(&ack_response) {
+        error!("[Worker {}] ❌ Failed to send acknowledgment: {}", process::id(), e);
+    } else {
+        info!(
+            "[Worker {}] ✅ Acknowledgment sent successfully for message: {}",
+            process::id(),
+            message.message_id
+        );
+    }
 }
 
 async fn handle_message_seen(
