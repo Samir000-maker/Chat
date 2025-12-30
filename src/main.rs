@@ -682,7 +682,7 @@ async fn replay_pending_messages(
     if !messages.is_empty() {
         redis::cmd("DEL")
             .arg(&pending_key)
-            .query_async::<(), ()>(&mut redis.clone())
+            .query_async::<()>(&mut redis.clone())
             .await?;
         
         info!("📬 Replayed {} pending messages for {}", messages.len(), user_id);
@@ -714,7 +714,7 @@ async fn replay_pending_seen_events(
     if !events.is_empty() {
         redis::cmd("DEL")
             .arg(&pending_key)
-            .query_async::<(), ()>(&mut redis.clone())
+            .query_async::<()>(&mut redis.clone())
             .await?;
         
         info!("👁️ Replayed {} pending seen events for {}", events.len(), user_id);
