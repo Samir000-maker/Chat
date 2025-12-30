@@ -503,13 +503,6 @@ async fn handle_chat_message(
     }
 
     info!("[Worker {}] ✅ Rate limit check passed", process::id());
-                    message: "Rate limit exceeded".to_string(),
-                },
-            );
-            return;
-        }
-        info!("✅ Rate limit check passed");
-    }
 
     info!(
         "💬 Message {}: {} -> {}",
