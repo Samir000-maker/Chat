@@ -227,14 +227,18 @@ async fn main() -> anyhow::Result<()> {
         message_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    // Create Socket.IO layer
+    // Create Socket.IO layer with protocol configuration
     let (socket_layer, io) = SocketIo::builder()
         .with_state(state.clone())
+        .max_buffer_size(1024 * 1024)
+        .ping_interval(Duration::from_secs(25))
+        .ping_timeout(Duration::from_secs(60))
         .build_layer();
 
     // Configure Socket.IO event handlers
     io.ns("/", |socket: SocketRef, _state: SocketState<AppState>| {
         info!("🔌 Client connected: {}", socket.id);
+        info!("📋 Registering Socket.IO event handlers for socket: {}", socket.id);
 
         // Register event
         socket.on(
@@ -262,10 +266,10 @@ async fn main() -> anyhow::Result<()> {
             },
         );
 
-        // Chat message event
+        // Chat message event - CRITICAL: State extractor must come BEFORE Data extractor
         socket.on(
             "chat message",
-            |socket: SocketRef, Data::<ChatMessage>(message), ack: AckSender, state: SocketState<AppState>| async move {
+            |socket: SocketRef, state: SocketState<AppState>, Data::<ChatMessage>(message), ack: AckSender| async move {
                 info!("[Worker {}] 🔔 CHAT MESSAGE EVENT TRIGGERED!", process::id());
                 info!("[Worker {}] 📨 Received message: {}", process::id(), message.message_id);
                 handle_chat_message(socket, message, ack, state).await;
@@ -294,6 +298,8 @@ async fn main() -> anyhow::Result<()> {
         socket.on_disconnect(|socket: SocketRef| async move {
             info!("🔌 Client disconnected: {}", socket.id);
         });
+        
+        info!("✅ All event handlers registered successfully for socket: {}", socket.id);
     });
 
     // Build HTTP router
