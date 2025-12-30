@@ -1,15 +1,11 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
+    response::{IntoResponse, Json},
+    routing::{delete, get, post},
+    Router,
 };
-use dashmap::DashMap;
-use parking_lot::RwLock;
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, Client as RedisClient, RedisError};
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
 use serde::{Deserialize, Serialize};
 use socketioxide::{
     extract::{Data, SocketRef, State as SocketState},
@@ -17,653 +13,820 @@ use socketioxide::{
 };
 use std::{
     collections::HashMap,
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::interval;
+use tokio::sync::RwLock;
 use tower::ServiceBuilder;
-use tower_http::{
-    compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer,
-};
-use tracing::{debug, error, info, warn};
-use base64::{Engine as _, engine::general_purpose};
+use tower_http::cors::CorsLayer;
+use tracing::{error, info, warn};
 
-// ==================== CONSTANTS & CONFIGURATION ====================
-const MAX_CONNECTIONS: usize = 400_000;
-const GLOBAL_RATE_LIMIT: u64 = 1_000_000;
-const USER_RATE_LIMIT: u64 = 100;
-const RATE_WINDOW_SECS: u64 = 60;
-const PENDING_MESSAGE_TTL: i64 = 300;
-const REDIS_POOL_SIZE: usize = 32;
+mod crypto;
+mod fcm;
+mod rate_limit;
 
-// AES-128-GCM Encryption
-const AES_KEY: &[u8] = b"0123456789abcdef";
+use crypto::decrypt_message;
+use fcm::FcmService;
+use rate_limit::RateLimiter;
 
-// ==================== TYPES & STRUCTURES ====================
+// ==================== CONFIGURATION ====================
+
+const AES_KEY: &str = "0123456789abcdef";
+const RATE_LIMIT: u32 = 100;
+const RATE_WINDOW_MS: u64 = 60000;
+const MESSAGE_CACHE_TTL: u64 = 300;
+
+// ==================== DATA STRUCTURES ====================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
-    #[serde(rename = "messageId")]
-    message_id: String,
-    #[serde(rename = "chatId")]
-    chat_id: String,
     #[serde(rename = "senderId")]
     sender_id: String,
     #[serde(rename = "receiverId")]
     receiver_id: String,
+    #[serde(rename = "chatId")]
+    chat_id: String,
+    #[serde(rename = "messageId")]
+    message_id: String,
     content: String,
-    timestamp: String,
-    seen: bool,
-    #[serde(rename = "replyMessageId", skip_serializing_if = "Option::is_none")]
-    reply_message_id: Option<String>,
-    #[serde(rename = "replyMessage", skip_serializing_if = "Option::is_none")]
-    reply_message: Option<String>,
-    #[serde(rename = "senderUsername", skip_serializing_if = "Option::is_none")]
+    timestamp: u64,
+    #[serde(rename = "senderUsername")]
     sender_username: Option<String>,
-    #[serde(rename = "senderProfilePicUrl", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "senderProfilePicUrl")]
     sender_profile_pic_url: Option<String>,
-    #[serde(rename = "attachmentType", skip_serializing_if = "Option::is_none")]
-    attachment_type: Option<String>,
-    #[serde(rename = "attachmentName", skip_serializing_if = "Option::is_none")]
-    attachment_name: Option<String>,
-    #[serde(rename = "attachmentSize", skip_serializing_if = "Option::is_none")]
-    attachment_size: Option<i64>,
-    #[serde(rename = "attachmentUrl", skip_serializing_if = "Option::is_none")]
-    attachment_url: Option<String>,
-    #[serde(rename = "attachmentData", skip_serializing_if = "Option::is_none")]
-    attachment_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MessageSeen {
+struct MessageSeenEvent {
+    #[serde(rename = "userId")]
+    user_id: String,
     #[serde(rename = "messageId")]
     message_id: String,
     #[serde(rename = "chatId")]
     chat_id: String,
-    #[serde(rename = "userId")]
-    user_id: String,
-    timestamp: i64,
+    timestamp: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TypingIndicator {
-    #[serde(rename = "userId")]
-    user_id: String,
+struct TypingEvent {
+    #[serde(rename = "senderId")]
+    sender_id: String,
     #[serde(rename = "receiverId")]
     receiver_id: String,
     #[serde(rename = "chatId")]
     chat_id: String,
-    #[serde(rename = "isTyping")]
-    is_typing: bool,
+    typing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FcmTokenRequest {
+struct FcmTokenData {
+    token: String,
+    #[serde(rename = "deviceInfo")]
+    device_info: Option<serde_json::Value>,
+    #[serde(rename = "registeredAt")]
+    registered_at: u64,
+    #[serde(rename = "lastUpdated")]
+    last_updated: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterFcmRequest {
     #[serde(rename = "userId")]
     user_id: String,
     token: String,
-    #[serde(rename = "deviceInfo", skip_serializing_if = "Option::is_none")]
-    device_info: Option<HashMap<String, String>>,
+    #[serde(rename = "deviceInfo")]
+    device_info: Option<serde_json::Value>,
 }
 
-struct RateLimiter {
-    user_limits: Arc<DashMap<String, (u64, u64)>>,
-    global_counter: Arc<AtomicU64>,
-    global_reset: Arc<AtomicU64>,
+#[derive(Debug, Serialize)]
+struct MessageAck {
+    status: String,
+    #[serde(rename = "messageId")]
+    message_id: String,
+    timestamp: u64,
 }
 
-impl RateLimiter {
-    fn new() -> Self {
-        Self {
-            user_limits: Arc::new(DashMap::new()),
-            global_counter: Arc::new(AtomicU64::new(0)),
-            global_reset: Arc::new(AtomicU64::new(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    + RATE_WINDOW_SECS,
-            )),
-        }
-    }
-
-    fn check_global(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let reset_time = self.global_reset.load(Ordering::Relaxed);
-
-        if now > reset_time {
-            self.global_counter.store(0, Ordering::Relaxed);
-            self.global_reset
-                .store(now + RATE_WINDOW_SECS, Ordering::Relaxed);
-        }
-
-        let count = self.global_counter.fetch_add(1, Ordering::Relaxed);
-        count < GLOBAL_RATE_LIMIT
-    }
-
-    fn check_user(&self, user_id: &str) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let mut entry = self
-            .user_limits
-            .entry(user_id.to_string())
-            .or_insert((0, now + RATE_WINDOW_SECS));
-
-        if now > entry.1 {
-            *entry = (1, now + RATE_WINDOW_SECS);
-            true
-        } else if entry.0 < USER_RATE_LIMIT {
-            entry.0 += 1;
-            true
-        } else {
-            false
-        }
-    }
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    status: String,
+    message: String,
 }
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: String,
+    #[serde(rename = "fcmEnabled")]
+    fcm_enabled: bool,
+    #[serde(rename = "registeredTokens")]
+    registered_tokens: usize,
+    #[serde(rename = "firebaseInitialized")]
+    firebase_initialized: bool,
+}
+
+// ==================== APPLICATION STATE ====================
 
 #[derive(Clone)]
 struct AppState {
-    redis_pool: Arc<RwLock<Vec<ConnectionManager>>>,
-    fcm_tokens: Arc<DashMap<String, String>>,
-    rate_limiter: Arc<RateLimiter>,
-    metrics: Arc<Metrics>,
-    user_sockets: Arc<DashMap<String, String>>, // user_id -> socket_id mapping
+    redis: ConnectionManager,
+    fcm_tokens: Arc<RwLock<HashMap<String, FcmTokenData>>>,
+    fcm_service: Arc<FcmService>,
+    rate_limiter: Arc<RwLock<RateLimiter>>,
+    mongodb_api_url: String,
 }
 
-struct Metrics {
-    total_connections: AtomicUsize,
-    total_messages: AtomicU64,
-    active_users: AtomicUsize,
-    failed_messages: AtomicU64,
-    rate_limited: AtomicU64,
-}
+// ==================== MAIN ====================
 
-impl Metrics {
-    fn new() -> Self {
-        Self {
-            total_connections: AtomicUsize::new(0),
-            total_messages: AtomicU64::new(0),
-            active_users: AtomicUsize::new(0),
-            failed_messages: AtomicU64::new(0),
-            rate_limited: AtomicU64::new(0),
-        }
-    }
-}
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
-// ==================== ENCRYPTION ====================
+    // Load environment variables
+    dotenv::dotenv().ok();
 
-fn decrypt_message(encrypted_b64: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let combined = general_purpose::STANDARD.decode(encrypted_b64)?;
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse::<u16>()?;
 
-    if combined.len() < 12 + 16 {
-        return Ok("New message".to_string());
-    }
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
-    let iv = &combined[0..12];
-    let ciphertext_with_tag = &combined[12..];
+    let mongodb_api_url = std::env::var("MONGODB_API_URL")
+        .unwrap_or_else(|_| "https://server1-ki1x.onrender.com/api".to_string());
 
-    let unbound_key = UnboundKey::new(&AES_128_GCM, AES_KEY)
-        .map_err(|_| "Failed to create key")?;
-    let key = LessSafeKey::new(unbound_key);
-    
-    let nonce = Nonce::try_assume_unique_for_key(iv)
-        .map_err(|_| "Invalid nonce")?;
+    let fcm_service_account_path = std::env::var("FCM_SERVICE_ACCOUNT_PATH")
+        .unwrap_or_else(|_| "fcm-service-account.json".to_string());
 
-    let mut in_out = ciphertext_with_tag.to_vec();
-    let decrypted = key
-        .open_in_place(nonce, Aad::empty(), &mut in_out)
-        .map_err(|_| "Decryption failed")?;
+    info!("🚀 Starting Chat Server on port {}", port);
 
-    Ok(String::from_utf8(decrypted.to_vec())?)
-}
+    // Initialize Redis
+    info!("📡 Connecting to Redis at {}", redis_url);
+    let redis_client = redis::Client::open(redis_url)?;
+    let redis_conn = ConnectionManager::new(redis_client).await?;
+    info!("✅ Connected to Redis");
 
-// ==================== REDIS CONNECTION POOL ====================
+    // Initialize FCM
+    info!("📱 Initializing Firebase Cloud Messaging");
+    let fcm_service = Arc::new(FcmService::new(&fcm_service_account_path)?);
+    info!("✅ Firebase Admin initialized - Project: {}", fcm_service.project_id());
 
-async fn create_redis_pool(redis_url: &str) -> Result<Vec<ConnectionManager>, RedisError> {
-    let mut pool = Vec::with_capacity(REDIS_POOL_SIZE);
-    let client = RedisClient::open(redis_url)?;
+    // Initialize shared state
+    let state = AppState {
+        redis: redis_conn.clone(),
+        fcm_tokens: Arc::new(RwLock::new(HashMap::new())),
+        fcm_service,
+        rate_limiter: Arc::new(RwLock::new(RateLimiter::new(
+            RATE_LIMIT,
+            Duration::from_millis(RATE_WINDOW_MS),
+        ))),
+        mongodb_api_url,
+    };
 
-    for i in 0..REDIS_POOL_SIZE {
-        match ConnectionManager::new(client.clone()).await {
-            Ok(conn) => {
-                pool.push(conn);
-                if i == 0 {
-                    info!("✅ Redis connection established");
+    // Create Socket.IO layer
+    let (socket_layer, io) = SocketIo::builder()
+        .with_state(state.clone())
+        .build_layer();
+
+    // Configure Socket.IO event handlers
+    io.ns("/", |socket: SocketRef, state: SocketState<AppState>| {
+        info!("🔌 Client connected: {}", socket.id);
+
+        // Register event
+        socket.on(
+            "register",
+            |socket: SocketRef, Data::<String>(user_id), state: SocketState<AppState>| async move {
+                if user_id.is_empty() {
+                    socket.emit("error", json!({"message": "Invalid userId"})).ok();
+                    return;
                 }
-            }
-            Err(e) => {
-                warn!("⚠️ Redis connection {} failed: {}", i, e);
-                if i == 0 {
-                    break;
+
+                socket.leave_all().ok();
+                socket.join(&user_id).ok();
+                
+                info!("✅ User registered: {} (socket: {})", user_id, socket.id);
+
+                // Replay pending messages
+                if let Err(e) = replay_pending_messages(&socket, &user_id, &state.redis).await {
+                    error!("Failed to replay pending messages for {}: {}", user_id, e);
                 }
-            }
-        }
-    }
 
-    if pool.is_empty() {
-        warn!("⚠️ No Redis connections available - running without persistence");
-    } else {
-        info!("📦 Redis pool created with {} connections", pool.len());
-    }
-
-    Ok(pool)
-}
-
-fn get_redis_conn(state: &AppState) -> Option<ConnectionManager> {
-    let pool = state.redis_pool.read();
-    if pool.is_empty() {
-        return None;
-    }
-    let idx = rand::random::<usize>() % pool.len();
-    Some(pool[idx].clone())
-}
-
-// ==================== SOCKET.IO HANDLERS ====================
-
-async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>) {
-    let socket_id = socket.id.to_string();
-    info!("🟢 Socket connected: {} (Transport: {:?})", socket_id, socket.transport_type());
-    
-    state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
-    
-    // CRITICAL: Log the connection details for debugging
-    info!("🔍 Connection details: ID={}, Namespaces={:?}", socket_id, socket.ns());
-    
-// Register handler
-    socket.on(
-        "register",
-        |socket: SocketRef, Data::<String>(user_id), SocketState(state): SocketState<AppState>| async move {
-            info!("📝 User registered: {} -> {}", user_id, socket.id);
-            
-            // CRITICAL FIX: Increment active users when they register
-            state.metrics.active_users.fetch_add(1, Ordering::Relaxed);
-            
-            // Store user_id -> socket_id mapping
-            state.user_sockets.insert(user_id.clone(), socket.id.to_string());
-            
-            info!("📊 Active users after registration: {}", 
-                  state.metrics.active_users.load(Ordering::Relaxed));
-            
-            // Replay pending messages from Redis
-            if let Some(mut redis) = get_redis_conn(&state) {
-                let key = format!("pending:{}", user_id);
-                if let Ok(messages) = redis.lrange::<_, Vec<String>>(&key, 0, -1).await {
-                    for msg_str in messages {
-                        if let Ok(msg) = serde_json::from_str::<ChatMessage>(&msg_str) {
-                            let _ = socket.emit("chat message", msg);
-                        }
-                    }
-                    let _: Result<(), RedisError> = redis.del(&key).await;
-                    info!("📬 Replayed pending messages for user: {}", user_id);
+                // Replay pending seen events
+                if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state.redis).await {
+                    error!("Failed to replay pending seen events for {}: {}", user_id, e);
                 }
-            }
-            
-            // Send confirmation back to client
-            let _ = socket.emit("registered", serde_json::json!({
-                "success": true,
-                "userId": user_id,
-                "socketId": socket.id.to_string()
-            }));
-        },
-    );
-    
-    // Chat message handler
-socket.on(
-    "chat message",
-    |socket: SocketRef, Data::<ChatMessage>(msg), SocketState(state): SocketState<AppState>| async move {
-        info!("📨 Message: {} from {} to {}", msg.message_id, msg.sender_id, msg.receiver_id);
-        
-        // Rate limiting
-        if !state.rate_limiter.check_global() {
-            state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
-            warn!("⚠️ Global rate limit hit");
-            return;
-        }
-        
-        if !state.rate_limiter.check_user(&msg.sender_id) {
-            state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
-            warn!("⚠️ User rate limit hit: {}", msg.sender_id);
-            return;
-        }
-        
-        state.metrics.total_messages.fetch_add(1, Ordering::Relaxed);
-        
-        // CRITICAL: Echo message back to SENDER first (confirmation)
-        let echo_result = socket.emit("chat message", msg.clone());
-        if echo_result.is_ok() {
-            info!("✅ Echoed to sender: {}", msg.message_id);
-        } else {
-            error!("❌ Failed to echo to sender: {}", msg.message_id);
-        }
-        
-        // CRITICAL: Forward to RECEIVER
-        if let Some(receiver_socket_id) = state.user_sockets.get(&msg.receiver_id) {
-            let receiver_id_str = receiver_socket_id.value().clone();
-            info!("📤 Forwarding to receiver: {}", receiver_id_str);
-            
-            let forward_result = socket.to(receiver_id_str).emit("chat message", msg.clone());
-            if forward_result.is_ok() {
-                info!("✅ Delivered to receiver: {}", msg.receiver_id);
-            } else {
-                error!("❌ Failed to deliver to receiver: {}", msg.receiver_id);
-            }
-        } else {
-            info!("📦 Receiver offline: {}", msg.receiver_id);
-            store_pending_message(&state, &msg).await;
-            send_push_notification(&state, &msg).await;
-        }
-    },
-);
-    
-    // Message seen handler
-    socket.on(
-        "message_seen",
-        |socket: SocketRef, Data::<MessageSeen>(seen), SocketState(state): SocketState<AppState>| async move {
-            debug!("👁️ Message seen: {} by {}", seen.message_id, seen.user_id);
-            
-            // Broadcast to the other user in the chat
-            for entry in state.user_sockets.iter() {
-                if entry.key() != &seen.user_id {
-                    let _ = socket.to(entry.value().to_string()).emit("message_seen", seen.clone());
-                }
-            }
-        },
-    );
-    
-    // Typing indicator handler
-    socket.on(
-        "typing",
-        |socket: SocketRef, Data::<TypingIndicator>(typing), SocketState(state): SocketState<AppState>| async move {
-            debug!("⌨️ Typing: {} -> {}", typing.user_id, typing.receiver_id);
-            
-            // Send to receiver
-            if let Some(receiver_socket_id) = state.user_sockets.get(&typing.receiver_id) {
-                let _ = socket.to(receiver_socket_id.value().to_string()).emit("typing", typing);
-            }
-        },
-    );
-}
-
-
-
-async fn send_chat_notification(
-    State(state): State<AppState>,
-    Json(req): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let receiver_id = req.get("receiverUserId").and_then(|v| v.as_str()).unwrap_or("");
-    
-    info!("📲 Push notification request for user: {}", receiver_id);
-    
-    // In production, integrate with FCM here
-    // For now, just acknowledge receipt
-    
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "success": true,
-            "message": "Notification queued"
-        })),
-    )
-}
-
-
-async fn on_disconnect(socket: SocketRef, SocketState(state): SocketState<AppState>) {
-    info!("🔴 Socket disconnected: {}", socket.id);
-    
-    // Remove from user_sockets mapping
-    state.user_sockets.retain(|_, v| v != &socket.id.to_string());
-    state.metrics.active_users.fetch_sub(1, Ordering::Relaxed);
-    
-    info!(
-        "📊 Remaining connections: {}",
-        state.metrics.active_users.load(Ordering::Relaxed)
-    );
-}
-
-async fn store_pending_message(state: &AppState, msg: &ChatMessage) {
-    if let Some(mut redis) = get_redis_conn(state) {
-        let key = format!("pending:{}", msg.receiver_id);
-        let value = serde_json::to_string(&msg).unwrap_or_default();
-        
-        let _: Result<(), RedisError> = redis.rpush(&key, &value).await;
-        let _: Result<(), RedisError> = redis.expire(&key, PENDING_MESSAGE_TTL).await;
-        
-        debug!("📦 Message buffered for offline user: {}", msg.receiver_id);
-    }
-}
-
-async fn send_push_notification(state: &AppState, msg: &ChatMessage) {
-    if let Some(fcm_token) = state.fcm_tokens.get(&msg.receiver_id) {
-        let decrypted = decrypt_message(&msg.content)
-            .unwrap_or_else(|_| "New message".to_string());
-
-        let truncated = if decrypted.len() > 100 {
-            format!("{}...", &decrypted[..97])
-        } else {
-            decrypted
-        };
-
-        info!(
-            "📲 FCM push would be sent to {} - Token: {}... Message: {}",
-            msg.receiver_id,
-            &fcm_token.value()[..20.min(fcm_token.value().len())],
-            truncated
+            },
         );
-    }
+
+        // Chat message event
+        socket.on(
+            "chat message",
+            |socket: SocketRef, Data::<ChatMessage>(message), state: SocketState<AppState>| async move {
+                handle_chat_message(socket, message, state).await;
+            },
+        );
+
+        // Message seen event
+        socket.on(
+            "message_seen",
+            |socket: SocketRef, Data::<MessageSeenEvent>(data), state: SocketState<AppState>| async move {
+                handle_message_seen(socket, data, state).await;
+            },
+        );
+
+        // Typing event
+        socket.on(
+            "typing",
+            |socket: SocketRef, Data::<TypingEvent>(data)| async move {
+                if !data.receiver_id.is_empty() {
+                    socket.to(&data.receiver_id).emit("typing", &data).ok();
+                }
+            },
+        );
+
+        socket.on_disconnect(|socket: SocketRef| async move {
+            info!("🔌 Client disconnected: {}", socket.id);
+        });
+    });
+
+    // Build HTTP router
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/register-fcm-token", post(register_fcm_token))
+        .route("/fcm-tokens/count", get(get_fcm_token_count))
+        .route("/fcm-token/:user_id", delete(delete_fcm_token))
+        .route("/recent-chats/:user_id", get(get_recent_chats))
+        .layer(
+            ServiceBuilder::new()
+                .layer(CorsLayer::permissive())
+                .layer(socket_layer),
+        )
+        .with_state(state);
+
+    // Start server
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("🎉 Server listening on {}", addr);
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
 // ==================== HTTP HANDLERS ====================
 
+async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+    let token_count = state.fcm_tokens.read().await.len();
+    
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        fcm_enabled: true,
+        registered_tokens: token_count,
+        firebase_initialized: true,
+    })
+}
+
 async fn register_fcm_token(
     State(state): State<AppState>,
-    Json(req): Json<FcmTokenRequest>,
+    Json(req): Json<RegisterFcmRequest>,
 ) -> impl IntoResponse {
+    if req.user_id.is_empty() || req.token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": "userId and token are required"
+            })),
+        );
+    }
+
     if req.token.len() < 100 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
+            Json(json!({
                 "success": false,
                 "error": "Invalid FCM token format"
             })),
         );
     }
 
-    state.fcm_tokens.insert(req.user_id.clone(), req.token.clone());
-    info!("📱 FCM token registered for user: {}", req.user_id);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let token_data = FcmTokenData {
+        token: req.token.clone(),
+        device_info: req.device_info,
+        registered_at: now,
+        last_updated: now,
+    };
+
+    state
+        .fcm_tokens
+        .write()
+        .await
+        .insert(req.user_id.clone(), token_data);
+
+    info!(
+        "✅ FCM token registered for user: {} (token: {}...)",
+        req.user_id,
+        &req.token[..20.min(req.token.len())]
+    );
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(json!({
             "success": true,
             "message": "FCM token registered successfully"
         })),
     )
 }
 
-async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "healthy",
-        "active_connections": state.metrics.active_users.load(Ordering::Relaxed),
-        "total_messages": state.metrics.total_messages.load(Ordering::Relaxed),
-        "failed_messages": state.metrics.failed_messages.load(Ordering::Relaxed),
-        "rate_limited": state.metrics.rate_limited.load(Ordering::Relaxed),
-        "fcm_tokens": state.fcm_tokens.len(),
+async fn get_fcm_token_count(State(state): State<AppState>) -> impl IntoResponse {
+    let tokens = state.fcm_tokens.read().await;
+    let users: Vec<String> = tokens.keys().cloned().collect();
+
+    Json(json!({
+        "count": tokens.len(),
+        "users": users
     }))
 }
 
-async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let metrics = format!(
-        "# HELP chat_active_connections Number of active Socket.IO connections\n\
-         # TYPE chat_active_connections gauge\n\
-         chat_active_connections {}\n\
-         # HELP chat_total_messages Total messages processed\n\
-         # TYPE chat_total_messages counter\n\
-         chat_total_messages {}\n\
-         # HELP chat_failed_messages Total failed messages\n\
-         # TYPE chat_failed_messages counter\n\
-         chat_failed_messages {}\n\
-         # HELP chat_rate_limited Total rate limited requests\n\
-         # TYPE chat_rate_limited counter\n\
-         chat_rate_limited {}\n",
-        state.metrics.active_users.load(Ordering::Relaxed),
-        state.metrics.total_messages.load(Ordering::Relaxed),
-        state.metrics.failed_messages.load(Ordering::Relaxed),
-        state.metrics.rate_limited.load(Ordering::Relaxed),
+async fn delete_fcm_token(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> impl IntoResponse {
+    let mut tokens = state.fcm_tokens.write().await;
+    
+    if tokens.remove(&user_id).is_some() {
+        info!("🗑️ Token deleted for user: {}", user_id);
+        (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "message": "Token deleted"
+            })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "error": "Token not found"
+            })),
+        )
+    }
+}
+
+async fn get_recent_chats(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> impl IntoResponse {
+    info!("📥 Proxying recent chats request for {}", user_id);
+
+    let url = format!("{}/recent-chats/{}", state.mongodb_api_url, user_id);
+    
+    match reqwest::get(&url).await {
+        Ok(response) => match response.json::<serde_json::Value>().await {
+            Ok(data) => {
+                let chats = data.get("chats").cloned().unwrap_or(json!([]));
+                (StatusCode::OK, Json(chats))
+            }
+            Err(e) => {
+                error!("Failed to parse recent chats response: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Failed to parse response" })),
+                )
+            }
+        },
+        Err(e) => {
+            error!("Failed to fetch recent chats: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to fetch recent chats" })),
+            )
+        }
+    }
+}
+
+// ==================== SOCKET.IO MESSAGE HANDLERS ====================
+
+async fn handle_chat_message(
+    socket: SocketRef,
+    message: ChatMessage,
+    state: SocketState<AppState>,
+) {
+    // Validation
+    if message.sender_id.is_empty()
+        || message.receiver_id.is_empty()
+        || message.chat_id.is_empty()
+        || message.message_id.is_empty()
+    {
+        error!("Invalid message structure");
+        socket
+            .emit(
+                "ack",
+                ErrorResponse {
+                    status: "error".to_string(),
+                    message: "Invalid message structure".to_string(),
+                },
+            )
+            .ok();
+        return;
+    }
+
+    // Rate limiting
+    {
+        let mut limiter = state.rate_limiter.write().await;
+        if !limiter.check(&message.sender_id) {
+            warn!("Rate limit exceeded for {}", message.sender_id);
+            socket
+                .emit(
+                    "ack",
+                    ErrorResponse {
+                        status: "error".to_string(),
+                        message: "Rate limit exceeded".to_string(),
+                    },
+                )
+                .ok();
+            return;
+        }
+    }
+
+    info!(
+        "💬 Message {}: {} -> {}",
+        message.message_id, message.sender_id, message.receiver_id
     );
 
-    (StatusCode::OK, metrics)
-}
+    // Store message in Redis
+    let msg_key = format!("msg:{}", message.message_id);
+    let msg_json = serde_json::to_string(&message).unwrap();
 
-async fn root_handler() -> &'static str {
-    "Ultra Chat Server with Socket.IO - Running 🚀"
-}
+    if let Err(e) = redis::cmd("SETEX")
+        .arg(&msg_key)
+        .arg(MESSAGE_CACHE_TTL)
+        .arg(&msg_json)
+        .query_async::<_, ()>(&mut state.redis.clone())
+        .await
+    {
+        error!("Failed to store message in Redis: {}", e);
+    }
 
-// ==================== MAIN APPLICATION ====================
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .compact()
-        .init();
-
-    info!("🚀 Ultra Chat Server with Socket.IO Starting...");
-
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let port = std::env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_string())
-        .parse::<u16>()
-        .unwrap_or(3000);
-
-    info!("📡 Configured port: {}", port);
-
-    let redis_pool = match create_redis_pool(&redis_url).await {
-        Ok(pool) => pool,
-        Err(e) => {
-            warn!("⚠️ Redis connection failed: {} - continuing without Redis", e);
-            Vec::new()
+    // Update recent chats in MongoDB (fire and forget)
+    let mongodb_url = state.mongodb_api_url.clone();
+    let msg_clone = message.clone();
+    tokio::spawn(async move {
+        if let Err(e) = update_recent_chats_in_mongodb(&mongodb_url, &msg_clone).await {
+            error!("Failed to update recent chats: {}", e);
         }
-    };
+    });
 
-    let state = AppState {
-        redis_pool: Arc::new(RwLock::new(redis_pool)),
-        fcm_tokens: Arc::new(DashMap::with_capacity(100_000)),
-        rate_limiter: Arc::new(RateLimiter::new()),
-        metrics: Arc::new(Metrics::new()),
-        user_sockets: Arc::new(DashMap::with_capacity(MAX_CONNECTIONS)),
-    };
+    // Check if receiver is online
+    let receiver_sockets = socket.within(&message.receiver_id).sockets().unwrap_or_default();
+    let is_receiver_online = !receiver_sockets.is_empty();
 
-    // Create Socket.IO layer
-    let (layer, io) = SocketIo::builder()
-        .with_state(state.clone())
-        .build_layer();
-
-    // Register Socket.IO event handlers
-    io.ns("/", on_connect);
-    
-io.ns("/", |socket: SocketRef, SocketState(state): SocketState<AppState>| async move {
-        let socket_id = socket.id.to_string();
-        let state_clone = state.clone();
+    if is_receiver_online {
+        // Deliver to online user
+        socket
+            .within(&message.receiver_id)
+            .emit("chat message", &message)
+            .ok();
+        info!("✅ Message delivered to ONLINE user {}", message.receiver_id);
+    } else {
+        // Buffer for offline user
+        let pending_key = format!("pending:{}", message.receiver_id);
         
-        socket.on_disconnect(move |_socket: SocketRef| async move {
-            info!("🔴 Socket disconnected: {}", socket_id);
-            
-            // Remove from user_sockets mapping
-            state_clone.user_sockets.retain(|_, v| v != &socket_id);
-            
-            // CRITICAL FIX: Only decrement if count is greater than 0
-            let current = state_clone.metrics.active_users.load(Ordering::Relaxed);
-            if current > 0 {
-                state_clone.metrics.active_users.fetch_sub(1, Ordering::Relaxed);
-            }
-            
-            info!(
-                "📊 Remaining connections: {}",
-                state_clone.metrics.active_users.load(Ordering::Relaxed)
-            );
-        });
-    });
+        if let Err(e) = redis::cmd("RPUSH")
+            .arg(&pending_key)
+            .arg(&msg_json)
+            .query_async::<_, ()>(&mut state.redis.clone())
+            .await
+        {
+            error!("Failed to buffer message: {}", e);
+        }
 
-    // Build router with Socket.IO
-    let app = Router::new()
-        .route("/", get(root_handler))
-        .route("/health", get(health_check))
-        .route("/metrics", get(metrics_handler))
-        .route("/register-fcm-token", post(register_fcm_token))
-        .route("/send-chat-notification", post(send_chat_notification))
-        .layer(
-            ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http())
-                .layer(CompressionLayer::new())
-                .layer(
-                    CorsLayer::new()
-                        .allow_origin(tower_http::cors::Any)
-                        .allow_methods(tower_http::cors::Any)
-                        .allow_headers(tower_http::cors::Any)
-                ),
+        if let Err(e) = redis::cmd("EXPIRE")
+            .arg(&pending_key)
+            .arg(MESSAGE_CACHE_TTL)
+            .query_async::<_, ()>(&mut state.redis.clone())
+            .await
+        {
+            error!("Failed to set expiry on pending messages: {}", e);
+        }
+
+        info!("📦 Buffered message for OFFLINE user {}", message.receiver_id);
+
+        // Send push notification
+        info!("📲 Sending push notification to {}...", message.receiver_id);
+        
+        let tokens = state.fcm_tokens.read().await;
+        if let Some(token_data) = tokens.get(&message.receiver_id) {
+            let sender_name = message.sender_username.clone().unwrap_or_else(|| "Someone".to_string());
+            let content = message.content.clone();
+            
+            let fcm_service = state.fcm_service.clone();
+            let receiver_id = message.receiver_id.clone();
+            let chat_id = message.chat_id.clone();
+            let sender_id = message.sender_id.clone();
+            let token = token_data.token.clone();
+            
+            tokio::spawn(async move {
+                match send_push_notification(
+                    &fcm_service,
+                    &receiver_id,
+                    &sender_name,
+                    &content,
+                    &chat_id,
+                    &sender_id,
+                    &token,
+                )
+                .await
+                {
+                    Ok(message_id) => {
+                        info!("✅ Push notification sent - FCM ID: {}", message_id);
+                    }
+                    Err(e) => {
+                        warn!("⚠️ Push notification failed: {}", e);
+                    }
+                }
+            });
+        } else {
+            warn!("⚠️ No FCM token found for user: {}", message.receiver_id);
+        }
+    }
+
+    // Send acknowledgment
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    socket
+        .emit(
+            "ack",
+            MessageAck {
+                status: "delivered".to_string(),
+                message_id: message.message_id.clone(),
+                timestamp: now,
+            },
         )
-        .layer(layer)
-        .with_state(state.clone());
+        .ok();
+}
 
-    // Stats reporting task
-    tokio::spawn({
-        let state = state.clone();
-        async move {
-            let mut interval = interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                info!(
-                    "📊 Stats - Connections: {} | Messages: {} | Rate Limited: {}",
-                    state.metrics.active_users.load(Ordering::Relaxed),
-                    state.metrics.total_messages.load(Ordering::Relaxed),
-                    state.metrics.rate_limited.load(Ordering::Relaxed),
-                );
+async fn handle_message_seen(
+    socket: SocketRef,
+    data: MessageSeenEvent,
+    state: SocketState<AppState>,
+) {
+    if data.user_id.is_empty() || data.message_id.is_empty() {
+        error!("Invalid seen event data");
+        return;
+    }
+
+    info!("👁️ Message seen: {} by {}", data.message_id, data.user_id);
+
+    // Get original message to find sender
+    let msg_key = format!("msg:{}", data.message_id);
+    let msg_str: Option<String> = redis::cmd("GET")
+        .arg(&msg_key)
+        .query_async(&mut state.redis.clone())
+        .await
+        .ok()
+        .flatten();
+
+    let sender_id = match msg_str {
+        Some(s) => match serde_json::from_str::<ChatMessage>(&s) {
+            Ok(msg) => msg.sender_id,
+            Err(e) => {
+                error!("Failed to parse cached message: {}", e);
+                return;
             }
-        }
-    });
-
-    // Bind to address
-    let addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port));
-    
-    info!("🎯 Attempting to bind to address: {}", addr);
-    
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            let local_addr = listener.local_addr()?;
-            info!("✅ Successfully bound to: {}", local_addr);
-            info!("🌐 Server is now accessible on port {}", port);
-            listener
-        }
-        Err(e) => {
-            error!("❌ Failed to bind to {}: {}", addr, e);
-            info!("💡 Trying fallback IPv4-only binding...");
-            
-            let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
-            let listener = tokio::net::TcpListener::bind(addr_v4).await?;
-            let local_addr = listener.local_addr()?;
-            info!("✅ Successfully bound to IPv4: {}", local_addr);
-            listener
+        },
+        None => {
+            warn!("Message {} not found in cache", data.message_id);
+            return;
         }
     };
 
-    info!("📡 Max connections: {}", MAX_CONNECTIONS);
-    info!("⚡ Ready to handle Socket.IO connections!");
-    info!("🔗 Socket.IO endpoint: http://0.0.0.0:{}/socket.io/", port);
-    info!("💚 Health check: http://0.0.0.0:{}/health", port);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
 
-    axum::serve(listener, app).await?;
+    let evt = MessageSeenEvent {
+        user_id: data.user_id.clone(),
+        message_id: data.message_id.clone(),
+        chat_id: data.chat_id.clone(),
+        timestamp: now,
+    };
+
+    // Check if sender is online
+    let sender_sockets = socket.within(&sender_id).sockets().unwrap_or_default();
+    let is_sender_online = !sender_sockets.is_empty();
+
+    if is_sender_online {
+        socket.within(&sender_id).emit("message_seen", &evt).ok();
+    } else {
+        // Buffer for offline sender
+        let pending_key = format!("pending_seen:{}", sender_id);
+        let evt_json = serde_json::to_string(&evt).unwrap();
+
+        if let Err(e) = redis::cmd("RPUSH")
+            .arg(&pending_key)
+            .arg(&evt_json)
+            .query_async::<_, ()>(&mut state.redis.clone())
+            .await
+        {
+            error!("Failed to buffer seen event: {}", e);
+        }
+
+        if let Err(e) = redis::cmd("EXPIRE")
+            .arg(&pending_key)
+            .arg(MESSAGE_CACHE_TTL)
+            .query_async::<_, ()>(&mut state.redis.clone())
+            .await
+        {
+            error!("Failed to set expiry on pending seen events: {}", e);
+        }
+    }
+}
+
+// ==================== HELPER FUNCTIONS ====================
+
+async fn replay_pending_messages(
+    socket: &SocketRef,
+    user_id: &str,
+    redis: &ConnectionManager,
+) -> anyhow::Result<()> {
+    let pending_key = format!("pending:{}", user_id);
+    
+    let messages: Vec<String> = redis::cmd("LRANGE")
+        .arg(&pending_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut redis.clone())
+        .await?;
+
+    for msg_str in &messages {
+        if let Ok(msg) = serde_json::from_str::<ChatMessage>(msg_str) {
+            socket.emit("chat message", msg).ok();
+        }
+    }
+
+    if !messages.is_empty() {
+        redis::cmd("DEL")
+            .arg(&pending_key)
+            .query_async::<_, ()>(&mut redis.clone())
+            .await?;
+        
+        info!("📬 Replayed {} pending messages for {}", messages.len(), user_id);
+    }
 
     Ok(())
+}
+
+async fn replay_pending_seen_events(
+    socket: &SocketRef,
+    user_id: &str,
+    redis: &ConnectionManager,
+) -> anyhow::Result<()> {
+    let pending_key = format!("pending_seen:{}", user_id);
+    
+    let events: Vec<String> = redis::cmd("LRANGE")
+        .arg(&pending_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut redis.clone())
+        .await?;
+
+    for evt_str in &events {
+        if let Ok(evt) = serde_json::from_str::<MessageSeenEvent>(evt_str) {
+            socket.emit("message_seen", evt).ok();
+        }
+    }
+
+    if !events.is_empty() {
+        redis::cmd("DEL")
+            .arg(&pending_key)
+            .query_async::<_, ()>(&mut redis.clone())
+            .await?;
+        
+        info!("👁️ Replayed {} pending seen events for {}", events.len(), user_id);
+    }
+
+    Ok(())
+}
+
+async fn update_recent_chats_in_mongodb(
+    mongodb_url: &str,
+    message: &ChatMessage,
+) -> anyhow::Result<()> {
+    let url = format!("{}/recent-chats/update", mongodb_url);
+    
+    let payload = json!({
+        "senderId": message.sender_id,
+        "receiverId": message.receiver_id,
+        "chatId": message.chat_id,
+        "lastMessage": message.content,
+        "timestamp": message.timestamp,
+        "senderUsername": message.sender_username,
+        "senderProfilePicUrl": message.sender_profile_pic_url
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .json(&payload)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        info!("✅ Recent chats updated in MongoDB for chat {}", message.chat_id);
+    } else {
+        warn!("⚠️ Failed to update recent chats: status {}", response.status());
+    }
+
+    Ok(())
+}
+
+async fn send_push_notification(
+    fcm_service: &FcmService,
+    receiver_user_id: &str,
+    sender_name: &str,
+    message_text: &str,
+    chat_id: &str,
+    sender_id: &str,
+    token: &str,
+) -> anyhow::Result<String> {
+    info!("Original message text length: {}", message_text.len());
+    info!("First 30 chars: {}", &message_text[..30.min(message_text.len())]);
+
+    let mut notification_text = message_text.to_string();
+
+    // Check if message appears encrypted
+    let is_encrypted = message_text.len() > 40
+        && message_text.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=')
+        && !message_text.contains(' ');
+
+    if is_encrypted {
+        info!("Message appears encrypted, attempting decryption...");
+        match decrypt_message(message_text) {
+            Ok(decrypted) if decrypted != "New message" => {
+                notification_text = decrypted;
+                info!("✅ Successfully decrypted: \"{}\"", notification_text);
+            }
+            _ => {
+                info!("⚠️ Decryption failed, using fallback");
+                notification_text = "New message".to_string();
+            }
+        }
+    } else {
+        info!("Message does not appear encrypted");
+    }
+
+    // Truncate long messages
+    if notification_text.len() > 100 {
+        notification_text = format!("{}...", &notification_text[..97]);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+
+    let message_id = fcm_service
+        .send_notification(
+            token,
+            sender_name,
+            &notification_text,
+            chat_id,
+            sender_id,
+            &now,
+        )
+        .await?;
+
+    info!("✅ Push notification sent to {}", receiver_user_id);
+    info!("   From: {}", sender_name);
+    info!(
+        "   Message preview: \"{}{}\"",
+        &notification_text[..50.min(notification_text.len())],
+        if notification_text.len() > 50 { "..." } else { "" }
+    );
+
+    Ok(message_id)
+}
+
+#[macro_export]
+macro_rules! json {
+    ($($json:tt)+) => {
+        serde_json::json!($($json)+)
+    };
 }
