@@ -201,12 +201,12 @@ async fn main() -> anyhow::Result<()> {
             "register",
             |socket: SocketRef, Data::<String>(user_id), state: SocketState<AppState>| async move {
                 if user_id.is_empty() {
-                    socket.emit("error", &json!({"message": "Invalid userId"})).ok();
+                    let _: Result<(), _> = socket.emit("error", &json!({"message": "Invalid userId"}));
                     return;
                 }
 
-                socket.leave_all().ok();
-                socket.join(user_id).ok();
+                let _: Result<(), _> = socket.leave_all();
+                let _: Result<(), _> = socket.join(user_id.clone());
                 
                 info!("✅ User registered: {} (socket: {})", user_id, socket.id);
 
@@ -243,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
             "typing",
             |socket: SocketRef, Data::<TypingEvent>(data)| async move {
                 if !data.receiver_id.is_empty() {
-                    socket.to(data.receiver_id.as_str()).emit("typing", &data).ok();
+                    let _: Result<(), _> = socket.to(data.receiver_id.as_str()).emit("typing", &data);
                 }
             },
         );
@@ -429,15 +429,13 @@ async fn handle_chat_message(
         || message.message_id.is_empty()
     {
         error!("Invalid message structure");
-        socket
-            .emit(
-                "ack",
-                ErrorResponse {
-                    status: "error".to_string(),
-                    message: "Invalid message structure".to_string(),
-                },
-            )
-            .ok();
+        let _: Result<(), _> = socket.emit(
+            "ack",
+            &ErrorResponse {
+                status: "error".to_string(),
+                message: "Invalid message structure".to_string(),
+            },
+        );
         return;
     }
 
@@ -446,15 +444,13 @@ async fn handle_chat_message(
         let mut limiter = state.rate_limiter.write().await;
         if !limiter.check(&message.sender_id) {
             warn!("Rate limit exceeded for {}", message.sender_id);
-            socket
-                .emit(
-                    "ack",
-                    ErrorResponse {
-                        status: "error".to_string(),
-                        message: "Rate limit exceeded".to_string(),
-                    },
-                )
-                .ok();
+            let _: Result<(), _> = socket.emit(
+                "ack",
+                &ErrorResponse {
+                    status: "error".to_string(),
+                    message: "Rate limit exceeded".to_string(),
+                },
+            );
             return;
         }
     }
@@ -468,13 +464,15 @@ async fn handle_chat_message(
     let msg_key = format!("msg:{}", message.message_id);
     let msg_json = serde_json::to_string(&message).unwrap();
 
-    if let Err(e) = redis::cmd("SETEX")
+    let mut redis_conn = state.redis.clone();
+    let set_result: Result<(), redis::RedisError> = redis::cmd("SETEX")
         .arg(&msg_key)
         .arg(MESSAGE_CACHE_TTL)
         .arg(&msg_json)
-        .query_async::<_, ()>(&mut state.redis.clone())
-        .await
-    {
+        .query_async(&mut redis_conn)
+        .await;
+
+    if let Err(e) = set_result {
         error!("Failed to store message in Redis: {}", e);
     }
 
@@ -493,30 +491,32 @@ async fn handle_chat_message(
 
     if is_receiver_online {
         // Deliver to online user
-        socket
+        let _: Result<(), _> = socket
             .within(&message.receiver_id)
-            .emit("chat message", &message)
-            .ok();
+            .emit("chat message", &message);
         info!("✅ Message delivered to ONLINE user {}", message.receiver_id);
     } else {
         // Buffer for offline user
         let pending_key = format!("pending:{}", message.receiver_id);
         
-        if let Err(e) = redis::cmd("RPUSH")
+        let mut redis_conn = state.redis.clone();
+        let rpush_result: Result<(), redis::RedisError> = redis::cmd("RPUSH")
             .arg(&pending_key)
             .arg(&msg_json)
-            .query_async::<_, ()>(&mut state.redis.clone())
-            .await
-        {
+            .query_async(&mut redis_conn)
+            .await;
+
+        if let Err(e) = rpush_result {
             error!("Failed to buffer message: {}", e);
         }
 
-        if let Err(e) = redis::cmd("EXPIRE")
+        let expire_result: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
             .arg(&pending_key)
             .arg(MESSAGE_CACHE_TTL)
-            .query_async::<_, ()>(&mut state.redis.clone())
-            .await
-        {
+            .query_async(&mut redis_conn)
+            .await;
+
+        if let Err(e) = expire_result {
             error!("Failed to set expiry on pending messages: {}", e);
         }
 
@@ -567,16 +567,14 @@ async fn handle_chat_message(
         .unwrap()
         .as_millis() as u64;
 
-    socket
-        .emit(
-            "ack",
-            MessageAck {
-                status: "delivered".to_string(),
-                message_id: message.message_id.clone(),
-                timestamp: now,
-            },
-        )
-        .ok();
+    let _: Result<(), _> = socket.emit(
+        "ack",
+        &MessageAck {
+            status: "delivered".to_string(),
+            message_id: message.message_id.clone(),
+            timestamp: now,
+        },
+    );
 }
 
 async fn handle_message_seen(
@@ -593,23 +591,26 @@ async fn handle_message_seen(
 
     // Get original message to find sender
     let msg_key = format!("msg:{}", data.message_id);
-    let msg_str: Option<String> = redis::cmd("GET")
+    let mut redis_conn = state.redis.clone();
+    let msg_str: Result<Option<String>, redis::RedisError> = redis::cmd("GET")
         .arg(&msg_key)
-        .query_async(&mut state.redis.clone())
-        .await
-        .ok()
-        .flatten();
+        .query_async(&mut redis_conn)
+        .await;
 
     let sender_id = match msg_str {
-        Some(s) => match serde_json::from_str::<ChatMessage>(&s) {
+        Ok(Some(s)) => match serde_json::from_str::<ChatMessage>(&s) {
             Ok(msg) => msg.sender_id,
             Err(e) => {
                 error!("Failed to parse cached message: {}", e);
                 return;
             }
         },
-        None => {
+        Ok(None) => {
             warn!("Message {} not found in cache", data.message_id);
+            return;
+        }
+        Err(e) => {
+            error!("Failed to get message from Redis: {}", e);
             return;
         }
     };
@@ -631,27 +632,30 @@ async fn handle_message_seen(
     let is_sender_online = !sender_sockets.is_empty();
 
     if is_sender_online {
-        socket.within(&sender_id).emit("message_seen", &evt).ok();
+        let _: Result<(), _> = socket.within(&sender_id).emit("message_seen", &evt);
     } else {
         // Buffer for offline sender
         let pending_key = format!("pending_seen:{}", sender_id);
         let evt_json = serde_json::to_string(&evt).unwrap();
 
-        if let Err(e) = redis::cmd("RPUSH")
+        let mut redis_conn = state.redis.clone();
+        let rpush_result: Result<(), redis::RedisError> = redis::cmd("RPUSH")
             .arg(&pending_key)
             .arg(&evt_json)
-            .query_async::<_, ()>(&mut state.redis.clone())
-            .await
-        {
+            .query_async(&mut redis_conn)
+            .await;
+
+        if let Err(e) = rpush_result {
             error!("Failed to buffer seen event: {}", e);
         }
 
-        if let Err(e) = redis::cmd("EXPIRE")
+        let expire_result: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
             .arg(&pending_key)
             .arg(MESSAGE_CACHE_TTL)
-            .query_async::<_, ()>(&mut state.redis.clone())
-            .await
-        {
+            .query_async(&mut redis_conn)
+            .await;
+
+        if let Err(e) = expire_result {
             error!("Failed to set expiry on pending seen events: {}", e);
         }
     }
@@ -666,23 +670,24 @@ async fn replay_pending_messages(
 ) -> anyhow::Result<()> {
     let pending_key = format!("pending:{}", user_id);
     
+    let mut redis_conn = redis.clone();
     let messages: Vec<String> = redis::cmd("LRANGE")
         .arg(&pending_key)
         .arg(0)
         .arg(-1)
-        .query_async(&mut redis.clone())
+        .query_async(&mut redis_conn)
         .await?;
 
     for msg_str in &messages {
         if let Ok(msg) = serde_json::from_str::<ChatMessage>(msg_str) {
-            socket.emit("chat message", &msg).ok();
+            let _: Result<(), _> = socket.emit("chat message", &msg);
         }
     }
 
     if !messages.is_empty() {
-        redis::cmd("DEL")
+        let _: () = redis::cmd("DEL")
             .arg(&pending_key)
-            .query_async::<()>(&mut redis.clone())
+            .query_async(&mut redis_conn)
             .await?;
         
         info!("📬 Replayed {} pending messages for {}", messages.len(), user_id);
@@ -698,23 +703,24 @@ async fn replay_pending_seen_events(
 ) -> anyhow::Result<()> {
     let pending_key = format!("pending_seen:{}", user_id);
     
+    let mut redis_conn = redis.clone();
     let events: Vec<String> = redis::cmd("LRANGE")
         .arg(&pending_key)
         .arg(0)
         .arg(-1)
-        .query_async(&mut redis.clone())
+        .query_async(&mut redis_conn)
         .await?;
 
     for evt_str in &events {
         if let Ok(evt) = serde_json::from_str::<MessageSeenEvent>(evt_str) {
-            socket.emit("message_seen", evt).ok();
+            let _: Result<(), _> = socket.emit("message_seen", &evt);
         }
     }
 
     if !events.is_empty() {
-        redis::cmd("DEL")
+        let _: () = redis::cmd("DEL")
             .arg(&pending_key)
-            .query_async::<()>(&mut redis.clone())
+            .query_async(&mut redis_conn)
             .await?;
         
         info!("👁️ Replayed {} pending seen events for {}", events.len(), user_id);
