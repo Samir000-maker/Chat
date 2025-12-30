@@ -80,6 +80,7 @@ struct AndroidNotification {
 struct TokenResponse {
     access_token: String,
     expires_in: u64,
+    #[allow(dead_code)]
     token_type: String,
 }
 
