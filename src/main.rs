@@ -321,42 +321,44 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
 socket.on(
     "chat message",
     |socket: SocketRef, Data::<ChatMessage>(msg), SocketState(state): SocketState<AppState>| async move {
-        info!("📨 Message received: {} from {} to {}", msg.message_id, msg.sender_id, msg.receiver_id);
+        info!("📨 Message: {} from {} to {}", msg.message_id, msg.sender_id, msg.receiver_id);
         
         // Rate limiting
-        if !state.rate_limiter.check_global() || !state.rate_limiter.check_user(&msg.sender_id) {
+        if !state.rate_limiter.check_global() {
             state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
-            // CRITICAL: Still acknowledge even if rate limited
-            let _ = socket.emit("chat message", serde_json::json!({
-                "status": "rate_limited",
-                "messageId": msg.message_id
-            }));
+            warn!("⚠️ Global rate limit hit");
+            return;
+        }
+        
+        if !state.rate_limiter.check_user(&msg.sender_id) {
+            state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            warn!("⚠️ User rate limit hit: {}", msg.sender_id);
             return;
         }
         
         state.metrics.total_messages.fetch_add(1, Ordering::Relaxed);
         
-        // CRITICAL: Send acknowledgment IMMEDIATELY to sender
-        let ack_result = socket.emit("chat message", serde_json::json!({
-            "status": "delivered",
-            "messageId": msg.message_id.clone()
-        }));
-        
-        if ack_result.is_ok() {
-            info!("✅ ACK sent for message: {}", msg.message_id);
+        // CRITICAL: Echo message back to SENDER first (confirmation)
+        let echo_result = socket.emit("chat message", msg.clone());
+        if echo_result.is_ok() {
+            info!("✅ Echoed to sender: {}", msg.message_id);
         } else {
-            error!("❌ Failed to send ACK for message: {}", msg.message_id);
+            error!("❌ Failed to echo to sender: {}", msg.message_id);
         }
         
-        // Try to deliver to receiver
+        // CRITICAL: Forward to RECEIVER
         if let Some(receiver_socket_id) = state.user_sockets.get(&msg.receiver_id) {
             let receiver_id_str = receiver_socket_id.value().clone();
-            info!("📤 Forwarding to receiver socket: {}", receiver_id_str);
+            info!("📤 Forwarding to receiver: {}", receiver_id_str);
             
-            // CRITICAL: Use broadcast to specific socket
-            let _ = socket.to(receiver_id_str).emit("chat message", msg.clone());
+            let forward_result = socket.to(receiver_id_str).emit("chat message", msg.clone());
+            if forward_result.is_ok() {
+                info!("✅ Delivered to receiver: {}", msg.receiver_id);
+            } else {
+                error!("❌ Failed to deliver to receiver: {}", msg.receiver_id);
+            }
         } else {
-            info!("📦 Receiver offline, storing message");
+            info!("📦 Receiver offline: {}", msg.receiver_id);
             store_pending_message(&state, &msg).await;
             send_push_notification(&state, &msg).await;
         }
