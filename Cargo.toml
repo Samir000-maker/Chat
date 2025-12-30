@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }
-tokio-util = "0.7"
 
 # Web framework
 axum = { version = "0.7", features = ["ws", "macros"] }
@@ -14,7 +13,7 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Socket.IO compatible server
-socketioxide = { version = "0.15", features = ["state", "v4", "v5"] }
+socketioxide = { version = "0.15", features = ["state"] }
 
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
@@ -33,24 +32,19 @@ jsonwebtoken = "9.3"
 aes-gcm = "0.10"
 base64 = "0.22"
 
-# Utilities
-uuid = { version = "1.11", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
 anyhow = "1.0"
 thiserror = "2.0"
 
 # Configuration
 dotenv = "0.15"
 
-# Async utilities
-async-trait = "0.1"
-futures = "0.3"
+# Utilities
 parking_lot = "0.12"
-
-# Rate limiting
-governor = "0.7"
 
 [profile.release]
 opt-level = 3
