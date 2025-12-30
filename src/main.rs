@@ -675,7 +675,7 @@ async fn replay_pending_messages(
 
     for msg_str in &messages {
         if let Ok(msg) = serde_json::from_str::<ChatMessage>(msg_str) {
-            socket.emit("chat message", msg).ok();
+            socket.emit("chat message", &msg).ok();
         }
     }
 
