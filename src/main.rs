@@ -318,54 +318,50 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
     );
     
     // Chat message handler
-  socket.on(
-        "chat message",
-        |socket: SocketRef, Data::<ChatMessage>(msg), SocketState(state): SocketState<AppState>| async move {
-            info!("📨 Message received: {} from {} to {}", msg.message_id, msg.sender_id, msg.receiver_id);
-            
-            // Rate limiting
-            if !state.rate_limiter.check_global() {
-                state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
-                let _ = socket.emit("error", serde_json::json!({"error": "Global rate limit exceeded"}));
-                return;
-            }
-            
-            if !state.rate_limiter.check_user(&msg.sender_id) {
-                state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
-                let _ = socket.emit("error", serde_json::json!({"error": "User rate limit exceeded"}));
-                return;
-            }
-            
-            state.metrics.total_messages.fetch_add(1, Ordering::Relaxed);
-            
-            // CRITICAL FIX: Always emit acknowledgment to sender first
+socket.on(
+    "chat message",
+    |socket: SocketRef, Data::<ChatMessage>(msg), SocketState(state): SocketState<AppState>| async move {
+        info!("📨 Message received: {} from {} to {}", msg.message_id, msg.sender_id, msg.receiver_id);
+        
+        // Rate limiting
+        if !state.rate_limiter.check_global() || !state.rate_limiter.check_user(&msg.sender_id) {
+            state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            // CRITICAL: Still acknowledge even if rate limited
             let _ = socket.emit("chat message", serde_json::json!({
-                "status": "delivered",
+                "status": "rate_limited",
                 "messageId": msg.message_id
             }));
+            return;
+        }
+        
+        state.metrics.total_messages.fetch_add(1, Ordering::Relaxed);
+        
+        // CRITICAL: Send acknowledgment IMMEDIATELY to sender
+        let ack_result = socket.emit("chat message", serde_json::json!({
+            "status": "delivered",
+            "messageId": msg.message_id.clone()
+        }));
+        
+        if ack_result.is_ok() {
+            info!("✅ ACK sent for message: {}", msg.message_id);
+        } else {
+            error!("❌ Failed to send ACK for message: {}", msg.message_id);
+        }
+        
+        // Try to deliver to receiver
+        if let Some(receiver_socket_id) = state.user_sockets.get(&msg.receiver_id) {
+            let receiver_id_str = receiver_socket_id.value().clone();
+            info!("📤 Forwarding to receiver socket: {}", receiver_id_str);
             
-            info!("✅ Sent acknowledgment for message: {}", msg.message_id);
-            
-            // Check if receiver is online
-            if let Some(receiver_socket_id) = state.user_sockets.get(&msg.receiver_id) {
-                let receiver_id_str = receiver_socket_id.value().to_string();
-                info!("📤 Sending message to receiver socket: {}", receiver_id_str);
-                
-                // Send to specific receiver socket
-                let _ = socket.within(receiver_id_str).emit("chat message", msg.clone());
-                
-                info!("✅ Message delivered to online user: {}", msg.receiver_id);
-            } else {
-                info!("📦 Receiver {} offline, storing message", msg.receiver_id);
-                
-                // User offline, store in Redis
-                store_pending_message(&state, &msg).await;
-                
-                // Send push notification
-                send_push_notification(&state, &msg).await;
-            }
-        },
-    );
+            // CRITICAL: Use broadcast to specific socket
+            let _ = socket.to(receiver_id_str).emit("chat message", msg.clone());
+        } else {
+            info!("📦 Receiver offline, storing message");
+            store_pending_message(&state, &msg).await;
+            send_push_notification(&state, &msg).await;
+        }
+    },
+);
     
     // Message seen handler
     socket.on(
@@ -395,6 +391,29 @@ async fn on_connect(socket: SocketRef, SocketState(state): SocketState<AppState>
         },
     );
 }
+
+
+
+async fn send_chat_notification(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let receiver_id = req.get("receiverUserId").and_then(|v| v.as_str()).unwrap_or("");
+    
+    info!("📲 Push notification request for user: {}", receiver_id);
+    
+    // In production, integrate with FCM here
+    // For now, just acknowledge receipt
+    
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "message": "Notification queued"
+        })),
+    )
+}
+
 
 async fn on_disconnect(socket: SocketRef, SocketState(state): SocketState<AppState>) {
     info!("🔴 Socket disconnected: {}", socket.id);
@@ -581,6 +600,7 @@ io.ns("/", |socket: SocketRef, SocketState(state): SocketState<AppState>| async 
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_handler))
         .route("/register-fcm-token", post(register_fcm_token))
+        .route("/send-chat-notification", post(send_chat_notification))
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
