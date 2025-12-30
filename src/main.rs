@@ -11,7 +11,7 @@ use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use socketioxide::{
-    extract::{AckSender, Data, SocketRef},  // ✅ Remove State import
+    extract::{AckSender, Data, SocketRef},  // Keep these
     SocketIo,
 };
 use std::{
@@ -217,9 +217,7 @@ async fn main() -> anyhow::Result<()> {
         message_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
-// ==================== SOCKET.IO SETUP ====================
-
-let app_state_for_io = state.clone();
+// ==================== SOCKET.IO SETUP - COMPLETE REPLACEMENT ====================
 
 let (socket_layer, io) = SocketIo::builder()
     .with_state(state.clone())
@@ -228,82 +226,65 @@ let (socket_layer, io) = SocketIo::builder()
     .ping_timeout(Duration::from_secs(60))
     .build_layer();
 
-io.ns("/", move |socket: SocketRef| {
+// ✅ CRITICAL FIX: Use a connection handler function, not a closure
+io.ns("/", handle_connection);
+
+// Add this NEW FUNCTION before main():
+fn handle_connection(socket: SocketRef) {
     info!("[Worker {}] Client connected: {}", std::process::id(), socket.id);
 
-    // ✅ Use the captured state from the outer scope
-    let state = app_state_for_io.clone();
-
-    // Clone state for each handler
-    let state_register = state.clone();
-    let state_message = state.clone();
-    let state_seen = state.clone();
-
-    // Handler 1: register
+    // ✅ Register event handler: Extract state using the State extractor IN the handler parameters
     socket.on(
         "register",
-        move |socket: SocketRef, Data::<String>(user_id): Data<String>| {
-            let state = state_register.clone();
-            async move {
-                if user_id.is_empty() {
-                    let _ = socket.emit("error", &json!({"message": "Invalid userId"}));
-                    return;
-                }
+        |socket: SocketRef, Data(user_id): Data<String>, state: socketioxide::extract::State<AppState>| async move {
+            if user_id.is_empty() {
+                let _ = socket.emit("error", &json!({"message": "Invalid userId"}));
+                return;
+            }
 
-                let _ = socket.leave_all();
-                let _ = socket.join(user_id.clone());
-                
-                info!("[Worker {}] User registered: {}", std::process::id(), user_id);
+            let _ = socket.leave_all();
+            let _ = socket.join(user_id.clone());
+            
+            info!("[Worker {}] User registered: {}", std::process::id(), user_id);
 
-                if let Err(e) = replay_pending_messages(&socket, &user_id, &state).await {
-                    error!("Failed to replay pending messages for {}: {}", user_id, e);
-                }
+            if let Err(e) = replay_pending_messages(&socket, &user_id, &state.0).await {
+                error!("Failed to replay pending messages for {}: {}", user_id, e);
+            }
 
-                if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state).await {
-                    error!("Failed to replay pending seen events for {}: {}", user_id, e);
-                }
+            if let Err(e) = replay_pending_seen_events(&socket, &user_id, &state.0).await {
+                error!("Failed to replay pending seen events for {}: {}", user_id, e);
             }
         },
     );
 
-    // Handler 2: chat message
     socket.on(
         "chat message",
-        move |socket: SocketRef, Data::<ChatMessage>(message): Data<ChatMessage>, ack: AckSender| {
-            let state = state_message.clone();
-            async move {
-                info!("[Worker {}] 📨 Received message: {}", std::process::id(), message.message_id);
-                handle_chat_message(socket, message, ack, state).await;
-            }
+        |socket: SocketRef, Data(message): Data<ChatMessage>, ack: AckSender, state: socketioxide::extract::State<AppState>| async move {
+            info!("[Worker {}] 📨 Received message: {}", std::process::id(), message.message_id);
+            handle_chat_message(socket, message, ack, state.0).await;
         },
     );
 
-    // Handler 3: message_seen
     socket.on(
         "message_seen",
-        move |socket: SocketRef, Data::<MessageSeenEvent>(data): Data<MessageSeenEvent>| {
-            let state = state_seen.clone();
-            async move {
-                handle_message_seen(socket, data, state).await;
-            }
+        |socket: SocketRef, Data(data): Data<MessageSeenEvent>, state: socketioxide::extract::State<AppState>| async move {
+            handle_message_seen(socket, data, state.0).await;
         },
     );
 
-    // Handler 4: typing
     socket.on(
         "typing",
-        |socket: SocketRef, Data::<TypingEvent>(data): Data<TypingEvent>| async move {
+        |socket: SocketRef, Data(data): Data<TypingEvent>| async move {
             if !data.receiver_id.is_empty() {
                 let _ = socket.to(data.receiver_id.clone()).emit("typing", &data);
             }
         },
     );
 
-    // Handler 5: disconnect
     socket.on_disconnect(|socket: SocketRef| async move {
         info!("[Worker {}] Client disconnected: {}", std::process::id(), socket.id);
     });
-});
+}
 
     let app = Router::new()
         .route("/health", get(health_check))
