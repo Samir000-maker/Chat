@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use tracing::info;
 
 #[derive(Debug)]
 struct UserLimit {
@@ -15,6 +16,10 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(max_requests: u32, window: Duration) -> Self {
+        info!("🚦 RATE LIMITER: Initialized");
+        info!("   Max requests: {}", max_requests);
+        info!("   Window: {:?}", window);
+        
         Self {
             limits: HashMap::new(),
             max_requests,
@@ -24,7 +29,6 @@ impl RateLimiter {
 
     pub fn check(&mut self, user_id: &str) -> bool {
         let now = Instant::now();
-
         let limit = self.limits.entry(user_id.to_string()).or_insert_with(|| {
             UserLimit {
                 count: 0,
@@ -41,6 +45,8 @@ impl RateLimiter {
 
         // Check if limit exceeded
         if limit.count >= self.max_requests {
+            info!("🚦 RATE LIMITER: Limit exceeded for user {}", user_id);
+            info!("   Count: {}/{}", limit.count, self.max_requests);
             return false;
         }
 
@@ -51,10 +57,13 @@ impl RateLimiter {
 
     pub fn reset(&mut self, user_id: &str) {
         self.limits.remove(user_id);
+        info!("🚦 RATE LIMITER: Reset for user {}", user_id);
     }
 
     pub fn clear(&mut self) {
+        let count = self.limits.len();
         self.limits.clear();
+        info!("🚦 RATE LIMITER: Cleared all limits ({} users)", count);
     }
 }
 
@@ -66,7 +75,7 @@ mod tests {
     #[test]
     fn test_rate_limiter() {
         let mut limiter = RateLimiter::new(3, Duration::from_millis(100));
-
+        
         assert!(limiter.check("user1"));
         assert!(limiter.check("user1"));
         assert!(limiter.check("user1"));
@@ -80,11 +89,11 @@ mod tests {
     #[test]
     fn test_different_users() {
         let mut limiter = RateLimiter::new(2, Duration::from_secs(1));
-
+        
         assert!(limiter.check("user1"));
         assert!(limiter.check("user1"));
         assert!(!limiter.check("user1")); // user1 limited
-
+        
         assert!(limiter.check("user2")); // user2 should still work
         assert!(limiter.check("user2"));
         assert!(!limiter.check("user2")); // user2 limited
