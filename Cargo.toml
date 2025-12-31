@@ -4,48 +4,82 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Async runtime
 tokio = { version = "1.42", features = ["full"] }
-
-# Web framework
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-
-# Socket.IO compatible server
 socketioxide = { version = "0.15", features = ["state"] }
-
-# Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
-
-# HTTP client
 reqwest = { version = "0.12", features = ["json"] }
-
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# FCM with automatic OAuth handling
 fcm-service = "0.2.3"
 
-# Cryptography
 aes-gcm = "0.10"
 base64 = "0.22"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Error handling
 anyhow = "1.0"
 thiserror = "2.0"
-
-# Configuration
 dotenv = "0.15"
-
-# Utilities
 parking_lot = "0.12"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+
+# [package]
+# name = "chat-server"
+# version = "0.1.0"
+# edition = "2021"
+
+# [dependencies]
+# # Async runtime
+# tokio = { version = "1.42", features = ["full"] }
+
+# # Web framework
+# axum = { version = "0.7", features = ["ws", "macros"] }
+# tower = { version = "0.5", features = ["full"] }
+# tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# # Socket.IO compatible server
+# socketioxide = { version = "0.15", features = ["state"] }
+
+# # Redis
+# redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# # HTTP client
+# reqwest = { version = "0.12", features = ["json"] }
+
+# # Serialization
+# serde = { version = "1.0", features = ["derive"] }
+# serde_json = "1.0"
+
+# fcm-service = "0.2.3"
+
+# # Cryptography
+# aes-gcm = "0.10"
+# base64 = "0.22"
+
+# # Logging
+# tracing = "0.1"
+# tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# # Error handling
+# anyhow = "1.0"
+# thiserror = "2.0"
+
+# # Configuration
+# dotenv = "0.15"
+
+# # Utilities
+# parking_lot = "0.12"
+
+# [profile.release]
+# opt-level = 3
+# lto = true
+# codegen-units = 1
