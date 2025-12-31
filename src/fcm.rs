@@ -1,113 +1,45 @@
 use anyhow::{anyhow, Result};
-use gcp_auth::AuthenticationManager;
-use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use oauth_fcm::{create_shared_token_manager, Message, Notification, Target};
+use std::collections::HashMap;
+use std::fs::File;
+use std::sync::Arc;
 use tracing::{error, info};
 
-const FCM_ENDPOINT: &str = "https://fcm.googleapis.com/v1/projects";
-const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
-
-#[derive(Debug, Serialize)]
-struct FcmMessage {
-    message: Message,
-}
-
-#[derive(Debug, Serialize)]
-struct Message {
-    token: String,
-    notification: Notification,
-    data: MessageData,
-    android: AndroidConfig,
-}
-
-#[derive(Debug, Serialize)]
-struct Notification {
-    title: String,
-    body: String,
-}
-
-#[derive(Debug, Serialize)]
-struct MessageData {
-    #[serde(rename = "type")]
-    msg_type: String,
-    #[serde(rename = "chatId")]
-    chat_id: String,
-    #[serde(rename = "senderId")]
-    sender_id: String,
-    #[serde(rename = "senderName")]
-    sender_name: String,
-    #[serde(rename = "messageText")]
-    message_text: String,
-    timestamp: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AndroidConfig {
-    priority: String,
-    notification: AndroidNotification,
-}
-
-#[derive(Debug, Serialize)]
-struct AndroidNotification {
-    sound: String,
-    #[serde(rename = "channel_id")]
-    channel_id: String,
-    priority: String,
-    icon: String,
-    color: String,
-    #[serde(rename = "default_vibrate_timings")]
-    default_vibrate_timings: bool,
-    click_action: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct FcmResponse {
-    name: String,
-}
-
 pub struct FcmService {
-    auth_manager: AuthenticationManager,
+    token_manager: Arc<oauth_fcm::SharedTokenManager>,
     project_id: String,
 }
 
 impl FcmService {
-    pub async fn new(service_account_path: &str) -> Result<Self> {
-        info!("📱 FCM: Initializing with gcp_auth...");
+    pub fn new(service_account_path: &str) -> Result<Self> {
+        info!("📱 FCM: Initializing with oauth_fcm...");
         
-        // ✅ gcp_auth automatically handles JWT creation, signing, and token exchange
-        let auth_manager = AuthenticationManager::from_json_file(service_account_path).await?;
-        
-        // Get project ID from service account
-        let service_account_info = std::fs::read_to_string(service_account_path)?;
-        let parsed: serde_json::Value = serde_json::from_str(&service_account_info)?;
-        let project_id = parsed["project_id"]
+        // Read service account to get project_id
+        let service_account_content = std::fs::read_to_string(service_account_path)?;
+        let service_account: serde_json::Value = serde_json::from_str(&service_account_content)?;
+        let project_id = service_account["project_id"]
             .as_str()
             .ok_or_else(|| anyhow!("No project_id in service account"))?
             .to_string();
         
-        info!("✅ FCM: Initialized successfully with project: {}", project_id);
+        // Create token manager - handles all JWT/OAuth automatically
+        let file = File::open(service_account_path)
+            .map_err(|e| anyhow!("Failed to open service account: {}", e))?;
+        
+        let token_manager = create_shared_token_manager(file)
+            .map_err(|e| anyhow!("Failed to create token manager: {}", e))?;
+        
+        info!("✅ FCM: Initialized successfully");
+        info!("   Project ID: {}", project_id);
         
         Ok(Self {
-            auth_manager,
+            token_manager,
             project_id,
         })
     }
 
     pub fn project_id(&self) -> &str {
         &self.project_id
-    }
-
-    async fn get_access_token(&self) -> Result<String> {
-        info!("🔑 FCM: Getting access token via gcp_auth...");
-        
-        // ✅ gcp_auth handles everything: JWT creation, signing, caching
-        let token = self.auth_manager
-            .get_token(&[FCM_SCOPE])
-            .await?;
-        
-        info!("✅ FCM: Access token obtained");
-        
-        Ok(token.as_str().to_string())
     }
 
     pub async fn send_notification(
@@ -121,61 +53,59 @@ impl FcmService {
     ) -> Result<String> {
         info!("📤 FCM: Sending notification from: {}", sender_name);
 
-        let access_token = self.get_access_token().await?;
+        // Create data payload
+        let mut data = HashMap::new();
+        data.insert("type".to_string(), "chat_message".to_string());
+        data.insert("chatId".to_string(), chat_id.to_string());
+        data.insert("senderId".to_string(), sender_id.to_string());
+        data.insert("senderName".to_string(), sender_name.to_string());
+        data.insert("messageText".to_string(), message_text.to_string());
+        data.insert("timestamp".to_string(), timestamp.to_string());
 
-        let fcm_message = FcmMessage {
-            message: Message {
-                token: device_token.to_string(),
-                notification: Notification {
-                    title: sender_name.to_string(),
-                    body: message_text.to_string(),
-                },
-                data: MessageData {
-                    msg_type: "chat_message".to_string(),
-                    chat_id: chat_id.to_string(),
-                    sender_id: sender_id.to_string(),
-                    sender_name: sender_name.to_string(),
-                    message_text: message_text.to_string(),
-                    timestamp: timestamp.to_string(),
-                },
-                android: AndroidConfig {
-                    priority: "high".to_string(),
-                    notification: AndroidNotification {
-                        sound: "default".to_string(),
-                        channel_id: "chat_messages".to_string(),
-                        priority: "high".to_string(),
-                        icon: "ic_notification".to_string(),
-                        color: "#4CAF50".to_string(),
-                        default_vibrate_timings: true,
-                        click_action: "OPEN_CHAT".to_string(),
-                    },
-                },
-            },
-        };
-
-        let url = format!("{}/{}/messages:send", FCM_ENDPOINT, self.project_id);
-
-        let client = reqwest::Client::new();
-        let response = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("Content-Type", "application/json")
-            .json(&fcm_message)
-            .send()
-            .await?;
-
-        let status = response.status();
+        // Create Android config
+        let mut android_fields = HashMap::new();
+        android_fields.insert("priority".to_string(), serde_json::json!("high"));
         
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            error!("❌ FCM: Request failed: {} - {}", status, body);
-            return Err(anyhow!("FCM send failed: {} - {}", status, body));
-        }
+        let mut android_notification = HashMap::new();
+        android_notification.insert("sound".to_string(), serde_json::json!("default"));
+        android_notification.insert("channel_id".to_string(), serde_json::json!("chat_messages"));
+        android_notification.insert("priority".to_string(), serde_json::json!("high"));
+        android_notification.insert("icon".to_string(), serde_json::json!("ic_notification"));
+        android_notification.insert("color".to_string(), serde_json::json!("#4CAF50"));
+        android_notification.insert("default_vibrate_timings".to_string(), serde_json::json!(true));
+        android_notification.insert("click_action".to_string(), serde_json::json!("OPEN_CHAT"));
+        
+        android_fields.insert("notification".to_string(), serde_json::json!(android_notification));
 
-        let fcm_response: FcmResponse = response.json().await?;
+        // Build the message
+        let message = Message::builder()
+            .target(Target::Token(device_token.to_string()))
+            .notification(
+                Notification::builder()
+                    .title(sender_name)
+                    .body(message_text)
+                    .build()
+            )
+            .data(data)
+            .android(android_fields)
+            .build()
+            .map_err(|e| anyhow!("Failed to build message: {}", e))?;
 
-        info!("✅ FCM: Notification sent! Message ID: {}", fcm_response.name);
+        // Send the message - oauth_fcm handles everything!
+        let response = self.token_manager
+            .send_message(&self.project_id, message)
+            .await
+            .map_err(|e| {
+                error!("❌ FCM: Failed to send: {}", e);
+                anyhow!("Failed to send FCM message: {}", e)
+            })?;
 
-        Ok(fcm_response.name)
+        info!("✅ FCM: Notification sent successfully!");
+
+        // Extract message name from response
+        Ok(response.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sent")
+            .to_string())
     }
 }
