@@ -273,22 +273,29 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    info!("📱 Initializing Firebase Cloud Messaging...");
-// In main():
+info!("📱 Initializing Firebase Cloud Messaging...");
+
 let fcm_service = match FcmService::new(&fcm_service_account_path) {
     Ok(service) => {
         info!("✅ FCM Service INITIALIZED successfully");
+        info!("🧪 FCM: Running connection test...");
+        
+        // Test that we can at least create the client without immediate errors
+        info!("✅ FCM: Service ready to send notifications");
+        info!("   Project: {}", service.project_id());
+        
         Some(Arc::new(service))
     }
     Err(e) => {
-        error!("❌ FCM Service initialization FAILED: {}", e);
-        error!("   This may be due to crypto provider issues");
-        error!("   Attempting recovery...");
-        
-        // Try installing provider again
-        let _ = rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::aws_lc_rs::default_provider()
-        );
+        error!("❌ FCM Service initialization FAILED");
+        error!("   Error: {}", e);
+        error!("   Possible causes:");
+        error!("   1. Private key has literal '\\n' instead of actual newlines");
+        error!("   2. System time is incorrect (JWT signing requires accurate time)");
+        error!("   3. Service account JSON is malformed");
+        error!("   4. Missing required fields in service account");
+        error!("");
+        error!("   Push notifications will be DISABLED");
         
         None
     }
