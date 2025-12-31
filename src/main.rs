@@ -268,18 +268,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!("📱 Initializing Firebase Cloud Messaging...");
-    let fcm_service = match FcmService::new(&fcm_service_account_path) {
-        Ok(service) => {
-            info!("✅ FCM Service INITIALIZED successfully");
-            info!("   Project ID: {}", service.project_id());
-            Some(Arc::new(service))
-        }
-        Err(e) => {
-            error!("❌ FCM Service initialization FAILED: {}", e);
-            error!("   Push notifications will be DISABLED");
-            None
-        }
-    };
+// In main():
+let fcm_service = match FcmService::new(&fcm_service_account_path) {
+    Ok(service) => {
+        info!("✅ FCM Service INITIALIZED successfully");
+        Some(Arc::new(service))
+    }
+    Err(e) => {
+        error!("❌ FCM Service initialization FAILED: {}", e);
+        None
+    }
+};
 
     info!("🔐 Testing crypto module initialization...");
     match decrypt_message("dGVzdA==") {
