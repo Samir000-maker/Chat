@@ -215,6 +215,12 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // ✅ CRITICAL FIX: Install default crypto provider FIRST
+    rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider()
+    )
+    .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -276,6 +282,14 @@ let fcm_service = match FcmService::new(&fcm_service_account_path) {
     }
     Err(e) => {
         error!("❌ FCM Service initialization FAILED: {}", e);
+        error!("   This may be due to crypto provider issues");
+        error!("   Attempting recovery...");
+        
+        // Try installing provider again
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider()
+        );
+        
         None
     }
 };
