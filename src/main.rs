@@ -208,6 +208,8 @@ impl RateLimiter {
 
 // ==================== FCM MODULE ====================
 
+// ==================== FCM MODULE ====================
+
 use anyhow::{anyhow, Result};
 use fcm_service::{FcmService as FcmClient, FcmMessage, FcmNotification, Target};
 
@@ -251,7 +253,7 @@ impl FcmService {
         
         // Parse and validate service account JSON
         info!("🔍 FCM: Parsing service account JSON...");
-        let service_account: serde_json::Value = serde_json::from_str(&service_account_content)
+        let mut service_account: serde_json::Value = serde_json::from_str(&service_account_content)
             .map_err(|e| anyhow!("Failed to parse service account JSON: {}", e))?;
         
         // ✅ CRITICAL: Validate all required fields
@@ -294,9 +296,8 @@ impl FcmService {
         info!("   Has proper header: {}", has_proper_header);
         info!("   Has proper footer: {}", has_proper_footer);
         info!("   First 50 chars: {}", &private_key_raw.chars().take(50).collect::<String>());
-        info!("   Last 50 chars: {}", &private_key_raw.chars().rev().take(50).collect::<String>().chars().rev().collect::<String>());
         
-        // ✅ CRITICAL FIX: Handle escaped \n characters
+        // ✅ CRITICAL FIX: Handle escaped \n characters and ensure proper format
         let private_key = if literal_backslash_n > 0 {
             warn!("⚠️ FCM: Private key contains literal '\\n' strings - fixing...");
             let fixed = private_key_raw.replace("\\n", "\n");
@@ -307,6 +308,13 @@ impl FcmService {
             private_key_raw.to_string()
         };
         
+        // Ensure the key ends with a newline
+        let private_key = if !private_key.ends_with('\n') {
+            format!("{}\n", private_key)
+        } else {
+            private_key
+        };
+        
         // Validate PEM format
         if !private_key.starts_with("-----BEGIN PRIVATE KEY-----") {
             error!("❌ FCM: Invalid private key format - missing PEM header");
@@ -314,9 +322,9 @@ impl FcmService {
             return Err(anyhow!("Invalid private key format: missing PEM header"));
         }
         
-        if !private_key.ends_with("-----END PRIVATE KEY-----\n") && !private_key.ends_with("-----END PRIVATE KEY-----") {
-            warn!("⚠️ FCM: Private key may be missing proper PEM footer");
-            warn!("   Key ends with: {}", &private_key.chars().rev().take(30).collect::<String>().chars().rev().collect::<String>());
+        if !private_key.contains("-----END PRIVATE KEY-----") {
+            error!("❌ FCM: Invalid private key format - missing PEM footer");
+            return Err(anyhow!("Invalid private key format: missing PEM footer"));
         }
         
         // Check if key has reasonable structure
@@ -330,25 +338,13 @@ impl FcmService {
         info!("✅ FCM: Private key format validated");
         info!("   Final newline count: {}", final_newline_count);
         
-        // ✅ CRITICAL: Create corrected service account JSON
-        let corrected_service_account = serde_json::json!({
-            "type": service_account["type"],
-            "project_id": project_id,
-            "private_key_id": service_account["private_key_id"],
-            "private_key": private_key,
-            "client_email": client_email,
-            "client_id": service_account["client_id"],
-            "auth_uri": service_account["auth_uri"],
-            "token_uri": token_uri,
-            "auth_provider_x509_cert_url": service_account["auth_provider_x509_cert_url"],
-            "client_x509_cert_url": service_account["client_x509_cert_url"],
-            "universe_domain": service_account.get("universe_domain").unwrap_or(&serde_json::json!("googleapis.com"))
-        });
-        
-        let corrected_json = serde_json::to_string_pretty(&corrected_service_account)?;
+        // ✅ CRITICAL: Update the service_account JSON object with corrected private key
+        service_account["private_key"] = serde_json::Value::String(private_key);
         
         // ✅ Write corrected JSON to temp file
         let temp_path = "/tmp/fcm-service-account-corrected.json";
+        let corrected_json = serde_json::to_string_pretty(&service_account)?;
+        
         std::fs::write(temp_path, &corrected_json)
             .map_err(|e| anyhow!("Failed to write temp service account file: {}", e))?;
         info!("📝 FCM: Wrote CORRECTED service account to: {}", temp_path);
@@ -360,6 +356,11 @@ impl FcmService {
             return Err(anyhow!("Failed to write service account correctly"));
         }
         info!("✅ FCM: Temp file verified ({} bytes)", written_content.len());
+        
+        // Verify the private key in the written file
+        let verification: serde_json::Value = serde_json::from_str(&written_content)?;
+        let written_key = verification["private_key"].as_str().unwrap_or("");
+        info!("🔍 FCM: Verifying written private key has {} newlines", written_key.matches('\n').count());
         
         // Create FCM client with corrected temp file
         info!("🔧 FCM: Creating fcm-service client with corrected credentials...");
