@@ -218,151 +218,60 @@ struct FcmService {
 
 impl FcmService {
     fn new(service_account_path: &str) -> Result<Self> {
-        info!("📱 FCM: Initializing with fcm-service...");
+        info!("📱 FCM: Initializing with HARDCODED credentials...");
         
-        // ✅ CRITICAL: Check system time first
+        // ✅ Check system time first
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("System time before UNIX epoch!");
         let timestamp_secs = now.as_secs();
         info!("🕐 FCM: System time check: {} seconds since epoch", timestamp_secs);
         
-        // Warn if system time looks wrong (before 2020 or after 2030)
         if timestamp_secs < 1577836800 {
             error!("❌ FCM: System time appears to be BEFORE 2020! JWT signing will fail!");
             error!("   Current timestamp: {}", timestamp_secs);
-        } else if timestamp_secs > 1893456000 {
-            warn!("⚠️ FCM: System time appears to be AFTER 2030! Please verify.");
         } else {
             info!("✅ FCM: System time looks reasonable");
         }
         
-        // ✅ CRITICAL FIX: Check if path exists, otherwise read from env var
-        let service_account_content = if std::path::Path::new(service_account_path).exists() {
-            info!("📄 FCM: Reading service account from file: {}", service_account_path);
-            std::fs::read_to_string(service_account_path)?
-        } else {
-            info!("📄 FCM: File not found, reading from FCM_SERVICE_ACCOUNT_JSON env var");
-            std::env::var("FCM_SERVICE_ACCOUNT_JSON")
-                .map_err(|_| anyhow!("FCM_SERVICE_ACCOUNT_JSON environment variable not set"))?
-        };
+        // ✅ HARDCODED SERVICE ACCOUNT - No file reading, no env var issues
+        let service_account_json = r#"{
+  "type": "service_account",
+  "project_id": "projectt3-8c55e",
+  "private_key_id": "4aae9588bfd4a280861654e74db2c6ca437c90aa",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCtxR9yNNKvG8+5\njqz1t9qclKzQ7pXOORe8AcvxN+p7ysE4OsZNmrOpRJInVDSmN6mpDrJJ+WvvDRDJ\n37fFt7UqCNNLKieSCEHBuSM+Ue63JdLxctOm+wV/ajGQP266kcACnbG32+TUga8N\naLHPmTc8PU964a4SotlOdiPbDPouB1uLdi0AZ388Izffuua8i+A/L/+OUy/jAVRI\njKBhzDUprFn4XFPFYKJtwoD1mCx1YGqufS4UqW0vflonK7kNEKObnRNY5GZdydlG\nNA46ekpcjVPw/nzL1inwyRgKssS1LhNAzQmUuWfsNSbHCt9UGJrUcQwd+A5vWMVj\nIEoHWZyrAgMBAAECggEABUZuKXPkD2/LMwlbQ8xUhRtYUbFkd9Gw4EK3s7dsVVy2\n1+Ok4Hc5TAKqYypBvOgErP6mt+sr9SJS56X0eLqWc9O3wljhwaOhh2V85efr1MB/\nsle3iCKnrJIHNidOz7gb+Zha7EdvH2pea4xJlZFDpX8A+ix+sc8ixKh+dyhiMeJ3\nW7RRn4WBkmqDFG642yodcX8wGAerdty4bSsMHb9h3+gWZlP2YG7mXApvz/YssJTY\nw/hNI/RmwmrshDVVMgIK8HWuhBjbnOmmn/6SJugAcaGHiCNJDBqfd2mJh7RojJci\nj9uf25m3eXH2+hzrAdkxWouOrPy0sUbdnloX2+6/PQKBgQDzT9iWIegzoaMjbRBD\nPdb8/g1NTN/6tgcS9Y6LSKNUA4llLdVJUgSkApx24jO9i4ZYWI6ot30KSMukqAFM\nJRrAuzHnGuSpNiVTj+c2wYEOzF+wWtFGIqk65377RPHZnknhl+xAxLsKEf0+im3b\ndAnjTW1Gqp7cfUNaZL1yq7zThwKBgQC21OjjAFKBFAYIGinMG072eh813NstpOEg\nVU/iK02Zwt5EtaKuAruP5NZoeOtECBX9YpkAeTgh8Xu1alb1pPRI2gicSF+jtOT7\n4cRtQPrcQwps4MSDG707+tAiqREdZtbrubXoX5YASNKmR9JV75n7b/5GL0tW4LR5\ncRK2q8N+vQKBgQCLRTP7U7M/ApGH8KCzbI1HyP/CNHOsZU8NSiNqlIxwxYl6sc55\nJopjet8mqXnmUBv5K8+UwVrAbUSrnkMH2+FBWqVI3LrwJH8fIqq9S+vclZ1cK8/I\nLoTho6qqlx88an9tsvFXbYSGUh+8Ea6qQ/R4+FPJdFZ0bPsFnc5W+fietwKBgDnl\n/sI0TexWfPp/3pCmbUEct1mFUVuJBUoJ+jwzXmW9EkpMAvJ8Jw2QeF2pPUfUD7Ko\nUK+Xs7D8GiL/Q/6SeFHBykxDlxXuqT0i5+N5Wnf6OwjzvQeP90NRUCxJwgO/l3wa\n2YJ3EreQWDUUNYXFVMwNUUbEn2Upz71Nk5GJn2U5AoGBALw74a3Emnoz+01G5U2w\n/XzNutZRJgBtmrB2lGlJIzV5yT87SpoTNWxjd08IOzIaEtg8MNfJtDOcVQ+Xo406\n9JdA7eXBKS5sch7gRKCB3+4TVOf41FWDw9ZI8XI1f9kHurBrKCaDSw/7/5rX4zgi\nRbG6txVeBOUadCTd3J+qavk4\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk-fbsvc@projectt3-8c55e.iam.gserviceaccount.com",
+  "client_id": "107618378282601542129",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40projectt3-8c55e.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}"#;
         
-        info!("📊 FCM: Service account content length: {} bytes", service_account_content.len());
+        info!("📊 FCM: Using hardcoded service account");
         
-        // Parse and validate service account JSON
+        // Parse JSON
         info!("🔍 FCM: Parsing service account JSON...");
-        let service_account: serde_json::Value = serde_json::from_str(&service_account_content)
+        let service_account: serde_json::Value = serde_json::from_str(service_account_json)
             .map_err(|e| anyhow!("Failed to parse service account JSON: {}", e))?;
         
-        // ✅ CRITICAL: Validate all required fields
-        info!("🔍 FCM: Validating service account fields...");
         let project_id = service_account["project_id"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing 'project_id' in service account"))?
             .to_string();
         
-        let client_email = service_account["client_email"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing 'client_email' in service account"))?;
-        
-        let private_key_raw = service_account["private_key"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing 'private_key' in service account"))?;
-        
-        let token_uri = service_account["token_uri"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing 'token_uri' in service account"))?;
-        
         info!("✅ FCM: Service account validation passed");
         info!("   Project ID: {}", project_id);
-        info!("   Client Email: {}", client_email);
-        info!("   Token URI: {}", token_uri);
         
-        // ✅ CRITICAL: Detailed private key validation
-        info!("🔐 FCM: Validating private key format...");
-        info!("   Private Key raw length: {} chars", private_key_raw.len());
-        
-        // Count different types of characters in the private key
-        let newline_count = private_key_raw.matches('\n').count();
-        let literal_backslash_n = private_key_raw.matches("\\n").count();
-        let has_proper_header = private_key_raw.starts_with("-----BEGIN PRIVATE KEY-----");
-        let has_proper_footer = private_key_raw.contains("-----END PRIVATE KEY-----");
-        
-        info!("🔍 FCM: Private key analysis:");
-        info!("   Actual newlines (\\n): {}", newline_count);
-        info!("   Literal '\\n' strings: {}", literal_backslash_n);
-        info!("   Has proper header: {}", has_proper_header);
-        info!("   Has proper footer: {}", has_proper_footer);
-        info!("   First 50 chars: {}", &private_key_raw.chars().take(50).collect::<String>());
-        info!("   Last 50 chars: {}", &private_key_raw.chars().rev().take(50).collect::<String>().chars().rev().collect::<String>());
-        
-        // ✅ CRITICAL FIX: Handle escaped \n characters
-        let private_key = if literal_backslash_n > 0 {
-            warn!("⚠️ FCM: Private key contains literal '\\n' strings - fixing...");
-            let fixed = private_key_raw.replace("\\n", "\n");
-            info!("✅ FCM: Replaced {} literal '\\n' with actual newlines", literal_backslash_n);
-            info!("   New newline count: {}", fixed.matches('\n').count());
-            fixed
-        } else {
-            private_key_raw.to_string()
-        };
-        
-        // Validate PEM format
-        if !private_key.starts_with("-----BEGIN PRIVATE KEY-----") {
-            error!("❌ FCM: Invalid private key format - missing PEM header");
-            error!("   Key starts with: {}", &private_key.chars().take(30).collect::<String>());
-            return Err(anyhow!("Invalid private key format: missing PEM header"));
-        }
-        
-        if !private_key.ends_with("-----END PRIVATE KEY-----\n") && !private_key.ends_with("-----END PRIVATE KEY-----") {
-            warn!("⚠️ FCM: Private key may be missing proper PEM footer");
-            warn!("   Key ends with: {}", &private_key.chars().rev().take(30).collect::<String>().chars().rev().collect::<String>());
-        }
-        
-        // Check if key has reasonable structure
-        let final_newline_count = private_key.matches('\n').count();
-        if final_newline_count < 2 {
-            error!("❌ FCM: Private key has too few newlines ({})", final_newline_count);
-            error!("   This will cause JWT signature failures!");
-            return Err(anyhow!("Invalid private key format: insufficient line breaks"));
-        }
-        
-        info!("✅ FCM: Private key format validated");
-        info!("   Final newline count: {}", final_newline_count);
-        
-        // ✅ CRITICAL: Create corrected service account JSON
-        let corrected_service_account = serde_json::json!({
-            "type": service_account["type"],
-            "project_id": project_id,
-            "private_key_id": service_account["private_key_id"],
-            "private_key": private_key,
-            "client_email": client_email,
-            "client_id": service_account["client_id"],
-            "auth_uri": service_account["auth_uri"],
-            "token_uri": token_uri,
-            "auth_provider_x509_cert_url": service_account["auth_provider_x509_cert_url"],
-            "client_x509_cert_url": service_account["client_x509_cert_url"],
-            "universe_domain": service_account.get("universe_domain").unwrap_or(&serde_json::json!("googleapis.com"))
-        });
-        
-        let corrected_json = serde_json::to_string_pretty(&corrected_service_account)?;
-        
-        // ✅ Write corrected JSON to temp file
-        let temp_path = "/tmp/fcm-service-account-corrected.json";
-        std::fs::write(temp_path, &corrected_json)
+        // Write to temp file for fcm-service library
+        let temp_path = "/tmp/fcm-service-account-hardcoded.json";
+        std::fs::write(temp_path, service_account_json)
             .map_err(|e| anyhow!("Failed to write temp service account file: {}", e))?;
-        info!("📝 FCM: Wrote CORRECTED service account to: {}", temp_path);
+        info!("📝 FCM: Wrote service account to: {}", temp_path);
         
-        // Verify file was written correctly
-        let written_content = std::fs::read_to_string(temp_path)?;
-        if written_content.len() != corrected_json.len() {
-            error!("❌ FCM: Temp file content length mismatch!");
-            return Err(anyhow!("Failed to write service account correctly"));
-        }
-        info!("✅ FCM: Temp file verified ({} bytes)", written_content.len());
-        
-        // Create FCM client with corrected temp file
-        info!("🔧 FCM: Creating fcm-service client with corrected credentials...");
+        // Create FCM client
+        info!("🔧 FCM: Creating fcm-service client...");
         let client = FcmClient::new(temp_path);
         
         info!("✅ FCM: Client initialized successfully");
