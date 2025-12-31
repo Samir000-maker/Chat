@@ -268,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!("📱 Initializing Firebase Cloud Messaging...");
-    let fcm_service = match FcmService::new(&fcm_service_account_path) {
+    let fcm_service = match FcmService::new(&fcm_service_account_path).await {
         Ok(service) => {
             info!("✅ FCM Service INITIALIZED successfully");
             info!("   Project ID: {}", service.project_id());
