@@ -646,73 +646,62 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "/opt/render/project/src/fcm-service-account.json".to_string());
 
     info!("🚀 Starting Chat Server on port {}", port);
-    info!("📱 Looking for FCM service account at: {}", fcm_service_account_path);
 
-    if std::path::Path::new(&fcm_service_account_path).exists() {
-        info!("✅ FCM service account file found at: {}", fcm_service_account_path);
+    // ✅ CRITICAL: Initialize Redis with timeout (max 5 seconds)
+    info!("📡 Connecting to Redis (max 5s timeout)...");
+    let redis_conn = tokio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            match redis::Client::open(redis_url.clone()) {
+                Ok(client) => match ConnectionManager::new(client).await {
+                    Ok(conn) => Some(conn),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        }
+    ).await.unwrap_or_else(|_| {
+        warn!("⚠️ Redis connection timeout - using in-memory storage");
+        None
+    });
+
+    if redis_conn.is_some() {
+        info!("✅ Redis connected");
     } else {
-        error!("❌ FCM service account file NOT FOUND at: {}", fcm_service_account_path);
-        error!("   Push notifications will be DISABLED!");
+        warn!("💡 Using in-memory storage");
     }
 
-    info!("📡 Connecting to Redis at {}", redis_url);
-    let redis_conn = match redis::Client::open(redis_url.clone()) {
-        Ok(client) => match ConnectionManager::new(client).await {
-            Ok(conn) => {
-                info!("✅ Redis connection SUCCESSFUL");
-                Some(conn)
+    // ✅ CRITICAL: Initialize FCM with timeout (max 10 seconds)
+    info!("📱 Initializing FCM (max 10s timeout)...");
+    let fcm_service = tokio::time::timeout(
+        Duration::from_secs(10),
+        async {
+            match FcmService::new(&fcm_service_account_path) {
+                Ok(service) => {
+                    info!("✅ FCM initialized - Project: {}", service.project_id());
+                    Some(Arc::new(service))
+                }
+                Err(e) => {
+                    error!("❌ FCM init failed: {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                warn!("⚠️ Failed to connect to Redis: {}", e);
-                warn!("💡 Using in-memory storage");
-                None
-            }
-        },
-        Err(e) => {
-            warn!("⚠️ Invalid Redis URL: {}", e);
-            warn!("💡 Using in-memory storage");
-            None
         }
-    };
+    ).await.unwrap_or_else(|_| {
+        warn!("⚠️ FCM initialization timeout - push notifications disabled");
+        None
+    });
 
-    info!("📱 Initializing Firebase Cloud Messaging...");
-
-    let fcm_service = match FcmService::new(&fcm_service_account_path) {
-        Ok(service) => {
-            info!("✅ FCM Service INITIALIZED successfully");
-            info!("🧪 FCM: Running connection test...");
-            
-            // Test that we can at least create the client without immediate errors
-            info!("✅ FCM: Service ready to send notifications");
-            info!("   Project: {}", service.project_id());
-            
-            Some(Arc::new(service))
-        }
-        Err(e) => {
-            error!("❌ FCM Service initialization FAILED");
-            error!("   Error: {}", e);
-            error!("   Possible causes:");
-            error!("   1. Private key has literal '\\n' instead of actual newlines");
-            error!("   2. System time is incorrect (JWT signing requires accurate time)");
-            error!("   3. Service account JSON is malformed");
-            error!("   4. Missing required fields in service account");
-            error!("");
-            error!("   Push notifications will be DISABLED");
-            
-            None
-        }
-    };
-
-    info!("🔐 Testing crypto module initialization...");
+    info!("🔐 Testing crypto module...");
     match decrypt_message("dGVzdA==") {
-        Ok(_) => info!("✅ Crypto module initialized successfully"),
-        Err(e) => warn!("⚠️ Crypto module test failed (expected): {}", e),
+        Ok(_) => info!("✅ Crypto ready"),
+        Err(e) => warn!("⚠️ Crypto test failed (expected): {}", e),
     }
 
     let state = AppState {
         redis: redis_conn,
         fcm_tokens: Arc::new(RwLock::new(HashMap::new())),
-        fcm_service: fcm_service.clone(),
+        fcm_service,
         rate_limiter: Arc::new(RwLock::new(RateLimiter::new(
             RATE_LIMIT,
             Duration::from_millis(RATE_WINDOW_MS),
@@ -723,7 +712,7 @@ async fn main() -> anyhow::Result<()> {
         message_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    info!("🔧 Configuring Socket.IO server...");
+    info!("🔧 Configuring Socket.IO...");
     
     let (socket_layer, io) = SocketIo::builder()
         .with_state(state.clone())
@@ -732,9 +721,7 @@ async fn main() -> anyhow::Result<()> {
         .ping_timeout(Duration::from_secs(60))
         .build_layer();
 
-    info!("✅ Socket.IO configured");
     io.ns("/", handle_connection);
-    info!("✅ Socket.IO namespace '/' registered");
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -753,8 +740,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     
     info!("🎉 ═══════════════════════════════════════════");
-    info!("🎉 Server is LIVE and listening on {}", addr);
-    info!("🎉 Ready to accept connections!");
+    info!("🎉 Server LIVE on {} - PORT IS OPEN", addr);
     info!("🎉 ═══════════════════════════════════════════");
 
     axum::serve(listener, app).await?;
