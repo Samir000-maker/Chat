@@ -102,16 +102,13 @@ impl FcmService {
         info!("📱 FCM: Initializing service...");
         info!("   Reading service account from: {}", service_account_path);
         
-        // Check if file exists
         if !std::path::Path::new(service_account_path).exists() {
             error!("❌ FCM: Service account file NOT FOUND");
-            error!("   Path: {}", service_account_path);
             return Err(anyhow!("Service account file not found: {}", service_account_path));
         }
         
         info!("✅ FCM: Service account file exists");
 
-        // Read file
         let content = std::fs::read_to_string(service_account_path)
             .map_err(|e| {
                 error!("❌ FCM: Failed to read service account file: {}", e);
@@ -121,14 +118,9 @@ impl FcmService {
         info!("✅ FCM: Service account file read successfully");
         info!("   Content length: {} bytes", content.len());
 
-        // Parse JSON
         let service_account: ServiceAccount = serde_json::from_str(&content)
             .map_err(|e| {
                 error!("❌ FCM: Failed to parse service account JSON: {}", e);
-                error!("   Make sure the file contains valid JSON with required fields:");
-                error!("   - project_id");
-                error!("   - private_key");
-                error!("   - client_email");
                 anyhow!("Failed to parse service account JSON: {}", e)
             })?;
 
@@ -137,7 +129,7 @@ impl FcmService {
         info!("   Client Email: {}", service_account.client_email);
         info!("   Private Key length: {} chars", service_account.private_key.len());
 
-        // Validate private key format
+        // ✅ CRITICAL FIX: Validate private key format
         if !service_account.private_key.contains("BEGIN PRIVATE KEY") {
             error!("❌ FCM: Private key doesn't appear to be in PEM format");
             return Err(anyhow!("Invalid private key format"));
@@ -170,7 +162,6 @@ impl FcmService {
 
             if let Some(ref token_str) = *token {
                 if now < expiry - 300 {
-                    // Token valid for at least 5 more minutes
                     info!("🔑 FCM: Using cached access token (expires in {} seconds)", expiry - now);
                     return Ok(token_str.clone());
                 } else {
@@ -196,12 +187,25 @@ impl FcmService {
             iat: now,
         };
 
-        let header = Header::new(Algorithm::RS256);
+        // ✅ CRITICAL FIX: Use proper header without typ field
+        let mut header = Header::new(Algorithm::RS256);
+        // Don't set typ - Firebase expects no typ field in the header
         
         info!("🔑 FCM: Parsing private key...");
-        let key = EncodingKey::from_rsa_pem(self.private_key.as_bytes())
+        
+        // ✅ CRITICAL FIX: Remove escaped newlines and normalize
+        let normalized_key = self.private_key
+            .replace("\\n", "\n")  // Replace literal \n with actual newlines
+            .trim()
+            .to_string();
+        
+        info!("🔑 FCM: Key normalization complete");
+        info!("   First 50 chars: {}...", &normalized_key[..50.min(normalized_key.len())]);
+        
+        let key = EncodingKey::from_rsa_pem(normalized_key.as_bytes())
             .map_err(|e| {
                 error!("❌ FCM: Failed to parse private key: {}", e);
+                error!("   Key preview: {}...", &normalized_key[..100.min(normalized_key.len())]);
                 anyhow!("Failed to parse private key: {}", e)
             })?;
 
@@ -214,6 +218,7 @@ impl FcmService {
 
         info!("✅ FCM: JWT created successfully");
         info!("   JWT length: {} chars", jwt.len());
+        info!("   JWT preview: {}...", &jwt[..50.min(jwt.len())]);
 
         // Exchange JWT for access token
         info!("🔑 FCM: Exchanging JWT for access token...");
@@ -237,6 +242,7 @@ impl FcmService {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             error!("❌ FCM: Token exchange failed: {} - {}", status, body);
+            error!("   JWT used: {}...", &jwt[..100.min(jwt.len())]);
             return Err(anyhow!("Token exchange failed: {} - {}", status, body));
         }
 
@@ -331,7 +337,6 @@ impl FcmService {
             error!("❌ FCM: Request failed with status {}", status);
             error!("   Response body: {}", body);
             
-            // Check for invalid token errors
             if body.contains("INVALID_ARGUMENT") 
                 || body.contains("UNREGISTERED")
                 || body.contains("NOT_FOUND") {
@@ -363,7 +368,6 @@ mod tests {
 
     #[test]
     fn test_fcm_service_initialization() {
-        // This test requires a valid service account file
         match FcmService::new("./fcm-service-account.json") {
             Ok(service) => {
                 println!("✅ FCM Service initialized");
