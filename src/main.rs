@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "https://server1-ki1x.onrender.com/api".to_string());
 
     let fcm_service_account_path = std::env::var("FCM_SERVICE_ACCOUNT_PATH")
-        .unwrap_or_else(|_| "./fcm-service-account.json".to_string());
+        .unwrap_or_else(|_| "/opt/render/project/src/fcm-service-account.json".to_string());
 
     info!("🚀 Starting Chat Server on port {}", port);
     info!("📱 Looking for FCM service account at: {}", fcm_service_account_path);
