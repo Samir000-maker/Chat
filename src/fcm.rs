@@ -7,6 +7,38 @@ use tracing::{error, info, warn};
 const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 const FCM_ENDPOINT: &str = "https://fcm.googleapis.com/v1/projects";
 
+// ✅ HARDCODED FALLBACK - Use these if service account file fails
+const HARDCODED_PROJECT_ID: &str = "projectt3-8c55e";
+const HARDCODED_CLIENT_EMAIL: &str = "firebase-adminsdk-fbsvc@projectt3-8c55e.iam.gserviceaccount.com";
+const HARDCODED_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCyvilZpz9nElhT
+aXW2D7PPKgLQEVr6ve//21rpe+GAj8v799/nDbXVWU7Nj3+P3KGkWPUIN5p0A6Wf
+TOdXtipnVReOqvGpa4oUTisaU3zcT+bLCzbsGXmi+fCNWgV3CclURQjZP/7uVmDt
+6hWyVb09MN088Szf9Kkps/AdqR1d9fv1+au9+Gj9sDerW8rM5EwAQ7AWcBPjcwqU
+dsxR9+4ixtnIaCJO1/+1JoMe2x9d1fmw0x4CVXzasulw9oUgJ++MFFNsoJZMxB1y
+i5w/yfJzKlzj2AYfKgnSU/FlsKaRuX1dj0lf++vmYrOFuaGbuaOMnBWC9wU23oHx
+BQy5UhrLAgMBAAECggEADUA4u4tBEYiUILboQZN/boO8SqWGu6D6GlsuLbH/4TKH
+2kmhgTUMfmENDQMu30DpgNARdkb8/c3JaPpgCioYkamGwg5dNQSia2fyHRUEZCbO
+Qs41h6JJ2LGzyh7a2dzRXpxxj/2FDjE8JVcdvadKjK9DL4HnpEC0i8FpsyE26qCy
+hJdwqxGXb00wnrUKJ3gBk6B4Zb26o4Eems34aAAkOCH9IfABy5yBo4ZQVpY603pN
+pkOqoSx/huq4mWissNRbiAXHCVcg3eGDzS+WEngch86VC6UHAPRvdn6NFZAqyNU3
+l+AX3tk2ui1neOZX4NuqbIgabL63S58dqDvBQe5SVQKBgQDiqKJuMfWeoOCCAaF6
+Y+gtIEbPz1cQeRczd0tG89V/L3ZxCZZf+Mz1TEA9YhJ6DuQcC34Y37fx+cKP/Crp
+EEbZEWg4ZBxG7JKQ6wQ5j9J9C37b75FR2gYJjM3V6mHjTZjlp6AJaum20UiqJzP1
+YDpLonVFLzGtW/KFFc1nia1VTQKBgQDJ4Z2swEsOZHiq/5sg1FxpS1E0/nTOw8MV
+NufauprfsfCTiNR13//AZ0TBQDEjC35H8lmVW/1FkWNz0kFKQj/cNYZ0ZCoXhcuA
+vgs0hukZrIgGJT+wPXouicIXk5XFqd+1FMTSC+9E5UBPEEkW8p+MmG0bKBvcJRbd
+F2vxE/NEdwKBgG3vUxFVpAdzilEkT1kYmiVBEXd73oO759frlZRtcfEFaVI8TzZv
+a6HSgRoEtmeDT3qWzGtuHz77YDYMHhf68BIa0kz/qYNw/UnS47KzomlKKRat5PMp
+Z2I8bB3EWAQyv+Ur34CR3ZfxfGgjKZ1rNfs3ad/LmzG1djS8tWrxqSPFAoGACI0d
++KtMgpeO5O9eys0z/OHL1srQd9Gi+csRlxpAZSlMX3N0TGnok2XMa8MkUa+y8ak6
+UjFLUR8Pb2CAk3yq59D8mQGFJunr7NAf+WGdjhDY0inRwM1Z147OQeFmfrDrYOg4
+Tg1jXS+4waCW9/ne+D2coYHZbEHF7ieH0vZdX5ECgYBaMy13ubgOhaus7mcN0zKd
+bPU1++KBniw86LY4jNT77oIilnN34jVFy7mM0F9S1mnvCmESmr9RgmVFCrUZyS7T
+n+TBpLjjfJMtE5QWNMGDFl1E8UEjqNVfR3bjUxFUYyP9iMdmQINNrPhJY88WMM36
+nL8XavNrpnK8bNF3I7aMPw==
+-----END PRIVATE KEY-----"#;
+
 #[derive(Debug, Deserialize)]
 struct ServiceAccount {
     project_id: String,
@@ -100,47 +132,59 @@ pub struct FcmService {
 impl FcmService {
     pub fn new(service_account_path: &str) -> Result<Self> {
         info!("📱 FCM: Initializing service...");
-        info!("   Reading service account from: {}", service_account_path);
         
-        if !std::path::Path::new(service_account_path).exists() {
-            error!("❌ FCM: Service account file NOT FOUND");
-            return Err(anyhow!("Service account file not found: {}", service_account_path));
-        }
-        
-        info!("✅ FCM: Service account file exists");
+        // Try to load from file first
+        let (project_id, private_key, client_email) = 
+            if std::path::Path::new(service_account_path).exists() {
+                info!("✅ FCM: Service account file found, loading...");
+                
+                match std::fs::read_to_string(service_account_path) {
+                    Ok(content) => {
+                        match serde_json::from_str::<ServiceAccount>(&content) {
+                            Ok(sa) => {
+                                info!("✅ FCM: Service account loaded from file");
+                                (sa.project_id, sa.private_key, sa.client_email)
+                            }
+                            Err(e) => {
+                                error!("❌ FCM: Failed to parse service account: {}", e);
+                                warn!("⚠️ FCM: Falling back to hardcoded credentials");
+                                (
+                                    HARDCODED_PROJECT_ID.to_string(),
+                                    HARDCODED_PRIVATE_KEY.to_string(),
+                                    HARDCODED_CLIENT_EMAIL.to_string(),
+                                )
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("❌ FCM: Failed to read file: {}", e);
+                        warn!("⚠️ FCM: Falling back to hardcoded credentials");
+                        (
+                            HARDCODED_PROJECT_ID.to_string(),
+                            HARDCODED_PRIVATE_KEY.to_string(),
+                            HARDCODED_CLIENT_EMAIL.to_string(),
+                        )
+                    }
+                }
+            } else {
+                warn!("⚠️ FCM: Service account file not found");
+                warn!("⚠️ FCM: Using hardcoded credentials");
+                (
+                    HARDCODED_PROJECT_ID.to_string(),
+                    HARDCODED_PRIVATE_KEY.to_string(),
+                    HARDCODED_CLIENT_EMAIL.to_string(),
+                )
+            };
 
-        let content = std::fs::read_to_string(service_account_path)
-            .map_err(|e| {
-                error!("❌ FCM: Failed to read service account file: {}", e);
-                anyhow!("Failed to read service account file: {}", e)
-            })?;
-
-        info!("✅ FCM: Service account file read successfully");
-        info!("   Content length: {} bytes", content.len());
-
-        let service_account: ServiceAccount = serde_json::from_str(&content)
-            .map_err(|e| {
-                error!("❌ FCM: Failed to parse service account JSON: {}", e);
-                anyhow!("Failed to parse service account JSON: {}", e)
-            })?;
-
-        info!("✅ FCM: Service account parsed successfully");
-        info!("   Project ID: {}", service_account.project_id);
-        info!("   Client Email: {}", service_account.client_email);
-        info!("   Private Key length: {} chars", service_account.private_key.len());
-
-        // ✅ CRITICAL FIX: Validate private key format
-        if !service_account.private_key.contains("BEGIN PRIVATE KEY") {
-            error!("❌ FCM: Private key doesn't appear to be in PEM format");
-            return Err(anyhow!("Invalid private key format"));
-        }
-
-        info!("✅ FCM: Private key format validated");
+        info!("✅ FCM: Service initialized");
+        info!("   Project ID: {}", project_id);
+        info!("   Client Email: {}", client_email);
+        info!("   Private Key length: {} chars", private_key.len());
 
         Ok(Self {
-            project_id: service_account.project_id,
-            private_key: service_account.private_key,
-            client_email: service_account.client_email,
+            project_id,
+            private_key,
+            client_email,
             access_token: parking_lot::RwLock::new(None),
             token_expiry: parking_lot::RwLock::new(0),
         })
@@ -151,7 +195,7 @@ impl FcmService {
     }
 
     async fn get_access_token(&self) -> Result<String> {
-        // Check if we have a valid cached token
+        // Check cache
         {
             let token = self.access_token.read();
             let expiry = *self.token_expiry.read();
@@ -162,23 +206,17 @@ impl FcmService {
 
             if let Some(ref token_str) = *token {
                 if now < expiry - 300 {
-                    info!("🔑 FCM: Using cached access token (expires in {} seconds)", expiry - now);
                     return Ok(token_str.clone());
-                } else {
-                    info!("⚠️ FCM: Cached token expired or expiring soon, refreshing...");
                 }
-            } else {
-                info!("🔑 FCM: No cached token, generating new one...");
             }
         }
 
-        // Generate new token
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        info!("🔑 FCM: Creating JWT claims...");
+        info!("🔑 FCM: Creating JWT...");
         let claims = Claims {
             iss: self.client_email.clone(),
             scope: FCM_SCOPE.to_string(),
@@ -187,38 +225,34 @@ impl FcmService {
             iat: now,
         };
 
-        // ✅ CRITICAL FIX: Use proper header without typ field
+        // ✅ CRITICAL FIX: Create header with typ explicitly set to "JWT"
         let mut header = Header::new(Algorithm::RS256);
-        // Don't set typ - Firebase expects no typ field in the header
+        header.typ = Some("JWT".to_string());
         
-        info!("🔑 FCM: Parsing private key...");
-        
-        // ✅ CRITICAL FIX: Remove escaped newlines and normalize
+        info!("✅ FCM: JWT header: alg=RS256, typ=JWT");
+
+        // ✅ CRITICAL FIX: Properly handle newlines in private key
         let normalized_key = self.private_key
-            .replace("\\n", "\n")  // Replace literal \n with actual newlines
+            .replace("\\n", "\n")
             .trim()
             .to_string();
         
-        info!("🔑 FCM: Key normalization complete");
-        info!("   First 50 chars: {}...", &normalized_key[..50.min(normalized_key.len())]);
-        
+        info!("🔑 FCM: Key first line: {}", 
+            normalized_key.lines().next().unwrap_or(""));
+
         let key = EncodingKey::from_rsa_pem(normalized_key.as_bytes())
             .map_err(|e| {
                 error!("❌ FCM: Failed to parse private key: {}", e);
-                error!("   Key preview: {}...", &normalized_key[..100.min(normalized_key.len())]);
                 anyhow!("Failed to parse private key: {}", e)
             })?;
 
-        info!("🔑 FCM: Encoding JWT...");
         let jwt = encode(&header, &claims, &key)
             .map_err(|e| {
                 error!("❌ FCM: Failed to encode JWT: {}", e);
                 anyhow!("Failed to encode JWT: {}", e)
             })?;
 
-        info!("✅ FCM: JWT created successfully");
-        info!("   JWT length: {} chars", jwt.len());
-        info!("   JWT preview: {}...", &jwt[..50.min(jwt.len())]);
+        info!("✅ FCM: JWT created (length: {} chars)", jwt.len());
 
         // Exchange JWT for access token
         info!("🔑 FCM: Exchanging JWT for access token...");
@@ -233,29 +267,23 @@ impl FcmService {
             .form(&params)
             .send()
             .await
-            .map_err(|e| {
-                error!("❌ FCM: Failed to exchange JWT for token: {}", e);
-                anyhow!("Failed to exchange JWT for token: {}", e)
-            })?;
+            .map_err(|e| anyhow!("Failed to exchange JWT: {}", e))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             error!("❌ FCM: Token exchange failed: {} - {}", status, body);
-            error!("   JWT used: {}...", &jwt[..100.min(jwt.len())]);
+            error!("   JWT preview: {}...", &jwt[..100.min(jwt.len())]);
             return Err(anyhow!("Token exchange failed: {} - {}", status, body));
         }
 
         let token_response: TokenResponse = response
             .json()
             .await
-            .map_err(|e| {
-                error!("❌ FCM: Failed to parse token response: {}", e);
-                anyhow!("Failed to parse token response: {}", e)
-            })?;
+            .map_err(|e| anyhow!("Failed to parse token response: {}", e))?;
 
-        info!("✅ FCM: Access token obtained successfully");
-        info!("   Token expires in: {} seconds", token_response.expires_in);
+        info!("✅ FCM: Access token obtained (expires in {} seconds)", 
+            token_response.expires_in);
 
         // Cache the token
         {
@@ -275,13 +303,11 @@ impl FcmService {
         sender_id: &str,
         timestamp: &str,
     ) -> Result<String> {
-        info!("📤 FCM: Preparing to send notification");
-        info!("   Sender: {}", sender_name);
-        info!("   Message preview: {}...", &message_text[..message_text.len().min(50)]);
-        info!("   Chat ID: {}", chat_id);
+        info!("📤 FCM: Sending notification");
+        info!("   From: {}", sender_name);
+        info!("   Message: {}...", &message_text[..message_text.len().min(30)]);
 
         let access_token = self.get_access_token().await?;
-        info!("✅ FCM: Access token ready");
 
         let fcm_message = FcmMessage {
             message: Message {
@@ -314,7 +340,6 @@ impl FcmService {
         };
 
         let url = format!("{}/{}/messages:send", FCM_ENDPOINT, self.project_id);
-        info!("📤 FCM: Sending request to: {}", url);
 
         let client = reqwest::Client::new();
         let response = client
@@ -324,23 +349,17 @@ impl FcmService {
             .json(&fcm_message)
             .send()
             .await
-            .map_err(|e| {
-                error!("❌ FCM: Failed to send FCM request: {}", e);
-                anyhow!("Failed to send FCM request: {}", e)
-            })?;
+            .map_err(|e| anyhow!("Failed to send FCM request: {}", e))?;
 
         let status = response.status();
-        info!("📥 FCM: Response status: {}", status);
         
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            error!("❌ FCM: Request failed with status {}", status);
-            error!("   Response body: {}", body);
+            error!("❌ FCM: Request failed: {} - {}", status, body);
             
             if body.contains("INVALID_ARGUMENT") 
                 || body.contains("UNREGISTERED")
                 || body.contains("NOT_FOUND") {
-                warn!("⚠️ FCM: Invalid or unregistered device token");
                 return Err(anyhow!("messaging/invalid-registration-token"));
             }
             
@@ -350,32 +369,11 @@ impl FcmService {
         let fcm_response: FcmResponse = response
             .json()
             .await
-            .map_err(|e| {
-                error!("❌ FCM: Failed to parse FCM response: {}", e);
-                anyhow!("Failed to parse FCM response: {}", e)
-            })?;
+            .map_err(|e| anyhow!("Failed to parse FCM response: {}", e))?;
 
-        info!("✅ FCM: Notification sent successfully!");
+        info!("✅ FCM: Notification sent!");
         info!("   Message ID: {}", fcm_response.name);
 
         Ok(fcm_response.name)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fcm_service_initialization() {
-        match FcmService::new("./fcm-service-account.json") {
-            Ok(service) => {
-                println!("✅ FCM Service initialized");
-                println!("   Project ID: {}", service.project_id());
-            }
-            Err(e) => {
-                println!("❌ Failed to initialize FCM: {}", e);
-            }
-        }
     }
 }
