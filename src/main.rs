@@ -17,20 +17,422 @@ use socketioxide::{
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH, Instant},
 };
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
-mod crypto;
-mod fcm;
-mod rate_limit;
+// ==================== CRYPTO MODULE ====================
 
-use crypto::decrypt_message;
-use fcm::FcmService;
-use rate_limit::RateLimiter;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes128Gcm, Nonce,
+};
+use base64::{engine::general_purpose, Engine as _};
+
+const AES_KEY: &str = "0123456789abcdef"; // Must match your Android app's key
+const GCM_IV_LENGTH: usize = 12;
+const GCM_TAG_LENGTH: usize = 16;
+
+/// Decrypt AES-GCM encrypted message
+/// Format: [IV (12 bytes)][Ciphertext][Auth Tag (16 bytes)]
+fn decrypt_message(encrypted_base64: &str) -> Result<String, String> {
+    let worker_id = std::process::id();
+    
+    info!("🔐 [Worker {}] CRYPTO: Starting decryption", worker_id);
+    info!("   Input length: {} chars", encrypted_base64.len());
+    
+    // Validate input
+    if encrypted_base64.is_empty() || encrypted_base64.len() < 20 {
+        error!("❌ [Worker {}] CRYPTO: Encrypted data too short", worker_id);
+        return Err("Encrypted data too short".to_string());
+    }
+
+    // Decode base64
+    info!("🔐 [Worker {}] CRYPTO: Decoding base64...", worker_id);
+    let combined = general_purpose::STANDARD
+        .decode(encrypted_base64)
+        .map_err(|e| {
+            error!("❌ [Worker {}] CRYPTO: Base64 decode error: {}", worker_id, e);
+            format!("Base64 decode error: {}", e)
+        })?;
+
+    info!("✅ [Worker {}] CRYPTO: Base64 decoded successfully", worker_id);
+    info!("   Decoded length: {} bytes", combined.len());
+
+    // Check minimum length (IV + at least some ciphertext + auth tag)
+    if combined.len() < GCM_IV_LENGTH + GCM_TAG_LENGTH {
+        error!("❌ [Worker {}] CRYPTO: Decoded data too short: {} bytes (need at least {})", 
+            worker_id, combined.len(), GCM_IV_LENGTH + GCM_TAG_LENGTH);
+        return Err(format!(
+            "Encrypted data too short: expected at least {} bytes, got {}",
+            GCM_IV_LENGTH + GCM_TAG_LENGTH,
+            combined.len()
+        ));
+    }
+
+    // Extract components:
+    // [0..12]: IV
+    // [12..len-16]: Ciphertext
+    // [len-16..len]: Auth Tag
+    let iv = &combined[0..GCM_IV_LENGTH];
+    let ciphertext_with_tag = &combined[GCM_IV_LENGTH..];
+    
+    // Split ciphertext and auth tag
+    let ciphertext_len = ciphertext_with_tag.len() - GCM_TAG_LENGTH;
+    let ciphertext = &ciphertext_with_tag[..ciphertext_len];
+    let auth_tag = &ciphertext_with_tag[ciphertext_len..];
+
+    info!("🔐 [Worker {}] CRYPTO: Component breakdown:", worker_id);
+    info!("   Total length: {} bytes", combined.len());
+    info!("   IV length: {} bytes", iv.len());
+    info!("   Ciphertext length: {} bytes", ciphertext.len());
+    info!("   Auth tag length: {} bytes", auth_tag.len());
+
+    // Prepare key
+    let key_bytes = AES_KEY.as_bytes();
+    if key_bytes.len() != 16 {
+        error!("❌ [Worker {}] CRYPTO: Invalid key length: {}", worker_id, key_bytes.len());
+        return Err("Invalid key length".to_string());
+    }
+
+    info!("✅ [Worker {}] CRYPTO: Key validated (16 bytes)", worker_id);
+
+    // Create cipher
+    info!("🔐 [Worker {}] CRYPTO: Creating AES-128-GCM cipher...", worker_id);
+    let cipher = Aes128Gcm::new_from_slice(key_bytes)
+        .map_err(|e| {
+            error!("❌ [Worker {}] CRYPTO: Failed to create cipher: {}", worker_id, e);
+            format!("Failed to create cipher: {}", e)
+        })?;
+
+    info!("✅ [Worker {}] CRYPTO: Cipher created successfully", worker_id);
+
+    // Create nonce
+    let nonce = Nonce::from_slice(iv);
+    info!("✅ [Worker {}] CRYPTO: Nonce created from IV", worker_id);
+
+    // Combine ciphertext + tag for decrypt (aes_gcm expects them together)
+    let mut payload = ciphertext.to_vec();
+    payload.extend_from_slice(auth_tag);
+    
+    info!("🔐 [Worker {}] CRYPTO: Payload prepared ({} bytes)", worker_id, payload.len());
+
+    // Decrypt
+    info!("🔐 [Worker {}] CRYPTO: Attempting decryption...", worker_id);
+    let decrypted = cipher.decrypt(nonce, payload.as_ref())
+        .map_err(|e| {
+            error!("❌ [Worker {}] CRYPTO: Decryption failed: {}", worker_id, e);
+            error!("   This usually means:");
+            error!("   - Wrong encryption key");
+            error!("   - Corrupted/tampered data");
+            error!("   - Wrong IV or auth tag");
+            format!("Decryption error: {}", e)
+        })?;
+
+    info!("✅ [Worker {}] CRYPTO: Decryption successful!", worker_id);
+    info!("   Decrypted length: {} bytes", decrypted.len());
+
+    // Convert to UTF-8 string
+    let decrypted_text = String::from_utf8(decrypted)
+        .map_err(|e| {
+            error!("❌ [Worker {}] CRYPTO: UTF-8 decode error: {}", worker_id, e);
+            format!("UTF-8 decode error: {}", e)
+        })?;
+
+    info!("✅ [Worker {}] CRYPTO: UTF-8 conversion successful", worker_id);
+    info!("   Decrypted text preview: \"{}...\"", 
+        &decrypted_text[..decrypted_text.len().min(50)]
+    );
+
+    Ok(decrypted_text)
+}
+
+// ==================== RATE LIMITER MODULE ====================
+
+#[derive(Debug)]
+struct UserLimit {
+    count: u32,
+    reset_time: Instant,
+}
+
+struct RateLimiter {
+    limits: HashMap<String, UserLimit>,
+    max_requests: u32,
+    window: Duration,
+}
+
+impl RateLimiter {
+    fn new(max_requests: u32, window: Duration) -> Self {
+        info!("🚦 RATE LIMITER: Initialized");
+        info!("   Max requests: {}", max_requests);
+        info!("   Window: {:?}", window);
+        
+        Self {
+            limits: HashMap::new(),
+            max_requests,
+            window,
+        }
+    }
+
+    fn check(&mut self, user_id: &str) -> bool {
+        let now = Instant::now();
+        let limit = self.limits.entry(user_id.to_string()).or_insert_with(|| {
+            UserLimit {
+                count: 0,
+                reset_time: now + self.window,
+            }
+        });
+
+        // Check if window has expired
+        if now >= limit.reset_time {
+            limit.count = 1;
+            limit.reset_time = now + self.window;
+            return true;
+        }
+
+        // Check if limit exceeded
+        if limit.count >= self.max_requests {
+            info!("🚦 RATE LIMITER: Limit exceeded for user {}", user_id);
+            info!("   Count: {}/{}", limit.count, self.max_requests);
+            return false;
+        }
+
+        // Increment and allow
+        limit.count += 1;
+        true
+    }
+}
+
+// ==================== FCM MODULE ====================
+
+use anyhow::{anyhow, Result};
+use fcm_service::{FcmService as FcmClient, FcmMessage, FcmNotification, Target};
+
+struct FcmService {
+    client: FcmClient,
+    project_id: String,
+}
+
+impl FcmService {
+    fn new(service_account_path: &str) -> Result<Self> {
+        info!("📱 FCM: Initializing with fcm-service...");
+        
+        // ✅ CRITICAL: Check system time first
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time before UNIX epoch!");
+        let timestamp_secs = now.as_secs();
+        info!("🕐 FCM: System time check: {} seconds since epoch", timestamp_secs);
+        
+        // Warn if system time looks wrong (before 2020 or after 2030)
+        if timestamp_secs < 1577836800 {
+            error!("❌ FCM: System time appears to be BEFORE 2020! JWT signing will fail!");
+            error!("   Current timestamp: {}", timestamp_secs);
+        } else if timestamp_secs > 1893456000 {
+            warn!("⚠️ FCM: System time appears to be AFTER 2030! Please verify.");
+        } else {
+            info!("✅ FCM: System time looks reasonable");
+        }
+        
+        // ✅ CRITICAL FIX: Check if path exists, otherwise read from env var
+        let service_account_content = if std::path::Path::new(service_account_path).exists() {
+            info!("📄 FCM: Reading service account from file: {}", service_account_path);
+            std::fs::read_to_string(service_account_path)?
+        } else {
+            info!("📄 FCM: File not found, reading from FCM_SERVICE_ACCOUNT_JSON env var");
+            std::env::var("FCM_SERVICE_ACCOUNT_JSON")
+                .map_err(|_| anyhow!("FCM_SERVICE_ACCOUNT_JSON environment variable not set"))?
+        };
+        
+        info!("📊 FCM: Service account content length: {} bytes", service_account_content.len());
+        
+        // Parse and validate service account JSON
+        info!("🔍 FCM: Parsing service account JSON...");
+        let service_account: serde_json::Value = serde_json::from_str(&service_account_content)
+            .map_err(|e| anyhow!("Failed to parse service account JSON: {}", e))?;
+        
+        // ✅ CRITICAL: Validate all required fields
+        info!("🔍 FCM: Validating service account fields...");
+        let project_id = service_account["project_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing 'project_id' in service account"))?
+            .to_string();
+        
+        let client_email = service_account["client_email"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing 'client_email' in service account"))?;
+        
+        let private_key_raw = service_account["private_key"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing 'private_key' in service account"))?;
+        
+        let token_uri = service_account["token_uri"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing 'token_uri' in service account"))?;
+        
+        info!("✅ FCM: Service account validation passed");
+        info!("   Project ID: {}", project_id);
+        info!("   Client Email: {}", client_email);
+        info!("   Token URI: {}", token_uri);
+        
+        // ✅ CRITICAL: Detailed private key validation
+        info!("🔐 FCM: Validating private key format...");
+        info!("   Private Key raw length: {} chars", private_key_raw.len());
+        
+        // Count different types of characters in the private key
+        let newline_count = private_key_raw.matches('\n').count();
+        let literal_backslash_n = private_key_raw.matches("\\n").count();
+        let has_proper_header = private_key_raw.starts_with("-----BEGIN PRIVATE KEY-----");
+        let has_proper_footer = private_key_raw.contains("-----END PRIVATE KEY-----");
+        
+        info!("🔍 FCM: Private key analysis:");
+        info!("   Actual newlines (\\n): {}", newline_count);
+        info!("   Literal '\\n' strings: {}", literal_backslash_n);
+        info!("   Has proper header: {}", has_proper_header);
+        info!("   Has proper footer: {}", has_proper_footer);
+        info!("   First 50 chars: {}", &private_key_raw.chars().take(50).collect::<String>());
+        info!("   Last 50 chars: {}", &private_key_raw.chars().rev().take(50).collect::<String>().chars().rev().collect::<String>());
+        
+        // ✅ CRITICAL FIX: Handle escaped \n characters
+        let private_key = if literal_backslash_n > 0 {
+            warn!("⚠️ FCM: Private key contains literal '\\n' strings - fixing...");
+            let fixed = private_key_raw.replace("\\n", "\n");
+            info!("✅ FCM: Replaced {} literal '\\n' with actual newlines", literal_backslash_n);
+            info!("   New newline count: {}", fixed.matches('\n').count());
+            fixed
+        } else {
+            private_key_raw.to_string()
+        };
+        
+        // Validate PEM format
+        if !private_key.starts_with("-----BEGIN PRIVATE KEY-----") {
+            error!("❌ FCM: Invalid private key format - missing PEM header");
+            error!("   Key starts with: {}", &private_key.chars().take(30).collect::<String>());
+            return Err(anyhow!("Invalid private key format: missing PEM header"));
+        }
+        
+        if !private_key.ends_with("-----END PRIVATE KEY-----\n") && !private_key.ends_with("-----END PRIVATE KEY-----") {
+            warn!("⚠️ FCM: Private key may be missing proper PEM footer");
+            warn!("   Key ends with: {}", &private_key.chars().rev().take(30).collect::<String>().chars().rev().collect::<String>());
+        }
+        
+        // Check if key has reasonable structure
+        let final_newline_count = private_key.matches('\n').count();
+        if final_newline_count < 2 {
+            error!("❌ FCM: Private key has too few newlines ({})", final_newline_count);
+            error!("   This will cause JWT signature failures!");
+            return Err(anyhow!("Invalid private key format: insufficient line breaks"));
+        }
+        
+        info!("✅ FCM: Private key format validated");
+        info!("   Final newline count: {}", final_newline_count);
+        
+        // ✅ CRITICAL: Create corrected service account JSON
+        let corrected_service_account = serde_json::json!({
+            "type": service_account["type"],
+            "project_id": project_id,
+            "private_key_id": service_account["private_key_id"],
+            "private_key": private_key,
+            "client_email": client_email,
+            "client_id": service_account["client_id"],
+            "auth_uri": service_account["auth_uri"],
+            "token_uri": token_uri,
+            "auth_provider_x509_cert_url": service_account["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": service_account["client_x509_cert_url"],
+            "universe_domain": service_account.get("universe_domain").unwrap_or(&serde_json::json!("googleapis.com"))
+        });
+        
+        let corrected_json = serde_json::to_string_pretty(&corrected_service_account)?;
+        
+        // ✅ Write corrected JSON to temp file
+        let temp_path = "/tmp/fcm-service-account-corrected.json";
+        std::fs::write(temp_path, &corrected_json)
+            .map_err(|e| anyhow!("Failed to write temp service account file: {}", e))?;
+        info!("📝 FCM: Wrote CORRECTED service account to: {}", temp_path);
+        
+        // Verify file was written correctly
+        let written_content = std::fs::read_to_string(temp_path)?;
+        if written_content.len() != corrected_json.len() {
+            error!("❌ FCM: Temp file content length mismatch!");
+            return Err(anyhow!("Failed to write service account correctly"));
+        }
+        info!("✅ FCM: Temp file verified ({} bytes)", written_content.len());
+        
+        // Create FCM client with corrected temp file
+        info!("🔧 FCM: Creating fcm-service client with corrected credentials...");
+        let client = FcmClient::new(temp_path);
+        
+        info!("✅ FCM: Client initialized successfully");
+        info!("   Ready to send notifications");
+        
+        Ok(Self {
+            client,
+            project_id,
+        })
+    }
+
+    fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    async fn send_notification(
+        &self,
+        device_token: &str,
+        sender_name: &str,
+        message_text: &str,
+        chat_id: &str,
+        sender_id: &str,
+        timestamp: &str,
+    ) -> Result<String> {
+        info!("📤 FCM: Attempting to send notification");
+        info!("   From: {}", sender_name);
+        info!("   Message preview: {}...", &message_text.chars().take(30).collect::<String>());
+        info!("   Token prefix: {}...", &device_token.chars().take(20).collect::<String>());
+
+        // Create notification
+        let mut notification = FcmNotification::new();
+        notification.set_title(sender_name.to_string());
+        notification.set_body(message_text.to_string());
+        notification.set_image(None);
+
+        // Create message
+        let mut message = FcmMessage::new();
+        message.set_notification(Some(notification));
+        message.set_target(Target::Token(device_token.to_string()));
+
+        // Add data payload
+        let mut data = HashMap::new();
+        data.insert("type".to_string(), "chat_message".to_string());
+        data.insert("chatId".to_string(), chat_id.to_string());
+        data.insert("senderId".to_string(), sender_id.to_string());
+        data.insert("senderName".to_string(), sender_name.to_string());
+        data.insert("messageText".to_string(), message_text.to_string());
+        data.insert("timestamp".to_string(), timestamp.to_string());
+        message.set_data(Some(data));
+
+        info!("🔐 FCM: Signing JWT and requesting OAuth token...");
+        
+        // Send notification
+        match self.client.send_notification(message).await {
+            Ok(_) => {
+                info!("✅ FCM: Notification sent successfully!");
+                Ok("sent".to_string())
+            }
+            Err(e) => {
+                error!("❌ FCM: Failed to send notification");
+                error!("   Error: {}", e);
+                error!("   This is likely due to:");
+                error!("   1. Invalid JWT signature (check private key format)");
+                error!("   2. System time mismatch (check server time)");
+                error!("   3. Invalid service account credentials");
+                Err(anyhow!("Failed to send FCM notification: {}", e))
+            }
+        }
+    }
+}
 
 // ==================== CONFIGURATION ====================
 
@@ -273,33 +675,33 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-info!("📱 Initializing Firebase Cloud Messaging...");
+    info!("📱 Initializing Firebase Cloud Messaging...");
 
-let fcm_service = match FcmService::new(&fcm_service_account_path) {
-    Ok(service) => {
-        info!("✅ FCM Service INITIALIZED successfully");
-        info!("🧪 FCM: Running connection test...");
-        
-        // Test that we can at least create the client without immediate errors
-        info!("✅ FCM: Service ready to send notifications");
-        info!("   Project: {}", service.project_id());
-        
-        Some(Arc::new(service))
-    }
-    Err(e) => {
-        error!("❌ FCM Service initialization FAILED");
-        error!("   Error: {}", e);
-        error!("   Possible causes:");
-        error!("   1. Private key has literal '\\n' instead of actual newlines");
-        error!("   2. System time is incorrect (JWT signing requires accurate time)");
-        error!("   3. Service account JSON is malformed");
-        error!("   4. Missing required fields in service account");
-        error!("");
-        error!("   Push notifications will be DISABLED");
-        
-        None
-    }
-};
+    let fcm_service = match FcmService::new(&fcm_service_account_path) {
+        Ok(service) => {
+            info!("✅ FCM Service INITIALIZED successfully");
+            info!("🧪 FCM: Running connection test...");
+            
+            // Test that we can at least create the client without immediate errors
+            info!("✅ FCM: Service ready to send notifications");
+            info!("   Project: {}", service.project_id());
+            
+            Some(Arc::new(service))
+        }
+        Err(e) => {
+            error!("❌ FCM Service initialization FAILED");
+            error!("   Error: {}", e);
+            error!("   Possible causes:");
+            error!("   1. Private key has literal '\\n' instead of actual newlines");
+            error!("   2. System time is incorrect (JWT signing requires accurate time)");
+            error!("   3. Service account JSON is malformed");
+            error!("   4. Missing required fields in service account");
+            error!("");
+            error!("   Push notifications will be DISABLED");
+            
+            None
+        }
+    };
 
     info!("🔐 Testing crypto module initialization...");
     match decrypt_message("dGVzdA==") {
@@ -456,7 +858,7 @@ fn handle_connection(socket: SocketRef) {
     info!("✅ [Worker {}] Event handlers registered for socket: {}", worker_id, socket.id);
 }
 
-// ==================== HTTP HANDLERS (same as before) ====================
+// ==================== HTTP HANDLERS ====================
 
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let token_count = state.fcm_tokens.read().await.len();
@@ -541,7 +943,7 @@ async fn get_recent_chats(
     }
 }
 
-// ==================== MESSAGE HANDLERS (continue in next file) ====================
+// ==================== MESSAGE HANDLERS ====================
 
 async fn handle_chat_message(
     socket: SocketRef,
