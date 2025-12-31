@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use fcm_service::{FcmService as FcmClient, FcmMessage, FcmNotification, Target};
 use std::collections::HashMap;
-use tracing::{error, info};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, info, warn, debug};
 
 pub struct FcmService {
     client: FcmClient,
@@ -11,6 +12,7 @@ pub struct FcmService {
 impl FcmService {
     pub fn new(service_account_path: &str) -> Result<Self> {
         info!("📱 FCM: Initializing with fcm-service...");
+        info!("🕐 FCM: System time check: {:?}", SystemTime::now());
         
         // ✅ CRITICAL FIX: Check if path exists, otherwise read from env var
         let service_account_content = if std::path::Path::new(service_account_path).exists() {
@@ -22,20 +24,68 @@ impl FcmService {
                 .map_err(|_| anyhow!("FCM_SERVICE_ACCOUNT_JSON environment variable not set"))?
         };
         
-        // Parse to get project_id
-        let service_account: serde_json::Value = serde_json::from_str(&service_account_content)?;
+        // Parse and validate service account JSON
+        info!("🔍 FCM: Parsing service account JSON...");
+        let service_account: serde_json::Value = serde_json::from_str(&service_account_content)
+            .map_err(|e| anyhow!("Failed to parse service account JSON: {}", e))?;
+        
+        // ✅ CRITICAL: Validate all required fields
+        info!("🔍 FCM: Validating service account fields...");
         let project_id = service_account["project_id"]
             .as_str()
-            .ok_or_else(|| anyhow!("No project_id in service account"))?
+            .ok_or_else(|| anyhow!("Missing 'project_id' in service account"))?
             .to_string();
         
+        let client_email = service_account["client_email"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing 'client_email' in service account"))?;
+        
+        let private_key = service_account["private_key"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing 'private_key' in service account"))?;
+        
+        let token_uri = service_account["token_uri"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing 'token_uri' in service account"))?;
+        
+        info!("✅ FCM: Service account validation passed");
+        info!("   Project ID: {}", project_id);
+        info!("   Client Email: {}", client_email);
+        info!("   Token URI: {}", token_uri);
+        info!("   Private Key Length: {} chars", private_key.len());
+        
+        // ✅ CRITICAL: Validate private key format
+        if !private_key.starts_with("-----BEGIN PRIVATE KEY-----") {
+            error!("❌ FCM: Invalid private key format - missing PEM header");
+            return Err(anyhow!("Invalid private key format"));
+        }
+        if !private_key.ends_with("-----END PRIVATE KEY-----\n") && !private_key.ends_with("-----END PRIVATE KEY-----") {
+            warn!("⚠️ FCM: Private key may be missing proper PEM footer");
+        }
+        
+        // Count newlines in private key (should have multiple for proper formatting)
+        let newline_count = private_key.matches('\n').count();
+        info!("🔍 FCM: Private key has {} newlines", newline_count);
+        if newline_count < 2 {
+            warn!("⚠️ FCM: Private key may not be properly formatted (too few newlines)");
+        }
+        
         // ✅ CRITICAL FIX: Write to temp file for fcm-service crate
-        // The fcm-service crate expects a file path, so we create a temp file
         let temp_path = "/tmp/fcm-service-account.json";
-        std::fs::write(temp_path, &service_account_content)?;
+        std::fs::write(temp_path, &service_account_content)
+            .map_err(|e| anyhow!("Failed to write temp service account file: {}", e))?;
         info!("📝 FCM: Wrote service account to temp file: {}", temp_path);
         
+        // Verify file was written correctly
+        let written_content = std::fs::read_to_string(temp_path)?;
+        if written_content != service_account_content {
+            error!("❌ FCM: Temp file content mismatch!");
+            return Err(anyhow!("Failed to write service account correctly"));
+        }
+        info!("✅ FCM: Temp file verified");
+        
         // Create FCM client with temp file path
+        info!("🔧 FCM: Creating fcm-service client...");
         let client = FcmClient::new(temp_path);
         
         info!("✅ FCM: Initialized successfully");
@@ -46,53 +96,3 @@ impl FcmService {
             project_id,
         })
     }
-
-    pub fn project_id(&self) -> &str {
-        &self.project_id
-    }
-
-    pub async fn send_notification(
-        &self,
-        device_token: &str,
-        sender_name: &str,
-        message_text: &str,
-        chat_id: &str,
-        sender_id: &str,
-        timestamp: &str,
-    ) -> Result<String> {
-        info!("📤 FCM: Sending notification from: {}", sender_name);
-        
-        // Create notification
-        let mut notification = FcmNotification::new();
-        notification.set_title(sender_name.to_string());
-        notification.set_body(message_text.to_string());
-        notification.set_image(None);
-        
-        // Create message
-        let mut message = FcmMessage::new();
-        message.set_notification(Some(notification));
-        message.set_target(Target::Token(device_token.to_string()));
-        
-        // Add data payload
-        let mut data = HashMap::new();
-        data.insert("type".to_string(), "chat_message".to_string());
-        data.insert("chatId".to_string(), chat_id.to_string());
-        data.insert("senderId".to_string(), sender_id.to_string());
-        data.insert("senderName".to_string(), sender_name.to_string());
-        data.insert("messageText".to_string(), message_text.to_string());
-        data.insert("timestamp".to_string(), timestamp.to_string());
-        message.set_data(Some(data));
-        
-        // Send notification
-        self.client
-            .send_notification(message)
-            .await
-            .map_err(|e| {
-                error!("❌ FCM: Failed to send: {}", e);
-                anyhow!("Failed to send FCM notification: {}", e)
-            })?;
-        
-        info!("✅ FCM: Notification sent successfully!");
-        Ok("sent".to_string())
-    }
-}
